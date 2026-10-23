@@ -6,8 +6,7 @@
 #define CAMERA_RESPONSE_API extern "C"
 #endif
 
-// ABI intentionally uses primitive pointers so other ASI plugins do not need
-// plugin-sdk headers. All vectors are camera-local: side, vertical, forward.
+// Plugin-sdk-free ABI; offsets use camera-local side/vertical/forward axes.
 CAMERA_RESPONSE_API unsigned CameraResponse_GetApiVersion();
 CAMERA_RESPONSE_API int CameraResponse_GetOffset(float* side, float* vertical, float* forward);
 CAMERA_RESPONSE_API int CameraResponse_GetRotation(float* pitchDeg, float* rollDeg, float* yawDeg);

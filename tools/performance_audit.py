@@ -2,8 +2,7 @@ from pathlib import Path
 import re
 
 root=Path(__file__).resolve().parents[1]
-cpp="\n".join(p.read_text(encoding="utf-8",errors="replace") for p in
-    (root/"source").glob("*.inc")) + (root/"source"/"CameraResponse.cpp").read_text(encoding="utf-8",errors="replace")
+cpp=(root/"source"/"CameraResponse.cpp").read_text(encoding="utf-8",errors="replace")
 ini=(root/"CameraResponse.ini").read_text(encoding="utf-8",errors="replace")
 warnings=[]
 
@@ -12,19 +11,17 @@ def value(section,key):
     if not m:
         return None
     k=re.search(rf"(?m)^{re.escape(key)}\s*=\s*(.+?)\s*$",m.group(1))
-    return k.group(1).split(';', 1)[0].strip() if k else None
+    return k.group(1).strip() if k else None
 
 if value("DebugAudit","Enabled")=="1":
     warnings.append("DebugAudit.Enabled=1 adds runtime accounting and periodic log I/O.")
 if value("Developer","RuntimeReload")=="1":
     warnings.append("Developer.RuntimeReload=1 polls a Windows key every game update.")
 
-scan=value("NearbyGunfire","ScanMs")
-try:
-    if scan is None or int(scan)<5:
-        warnings.append("NearbyGunfire.ScanMs below 5 can add redundant ped-pool work at high refresh rates.")
-except ValueError:
-    warnings.append("NearbyGunfire.ScanMs is not a valid integer.")
+# Scan interval is compiled in and intentionally not configurable.
+m=re.search(r"\bnearbyGunfireScanMs\s*=\s*(\d+)\s*;",cpp)
+if not m or int(m.group(1)) < 5:
+    warnings.append("Compiled-in nearby gunfire scan interval is missing or too aggressive.")
 
 if "ValidateUltimateFpRenderCallsites" in cpp:
     warnings.append("Dead UltimateFP render-callsite validator remains.")

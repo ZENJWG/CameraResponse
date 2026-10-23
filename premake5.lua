@@ -1,9 +1,5 @@
--- Camera Response - self-contained Premake project.
--- Generates a normal Visual Studio Win32 solution and links against the
--- already-built DK22Pac/plugin-sdk GTA SA library.
---
--- Usage:
---   deps\plugin-sdk\tools\premake\premake5.exe --file=premake5.lua vs2022 --pluginsdkdir="deps\plugin-sdk"
+-- Camera Response | Win32 Visual Studio ASI using prebuilt plugin-sdk.
+-- Generate: premake5.exe --file=premake5.lua vs2022 --pluginsdkdir="deps\plugin-sdk"
 
 newoption {
     trigger = "pluginsdkdir",
@@ -26,8 +22,7 @@ sdkDir = path.getabsolute(sdkDir)
 
 local pluginLib = path.join(sdkDir, "output/lib/Plugin.lib")
 if not os.isfile(pluginLib) then
-    -- Windows filesystems are normally case-insensitive, but keep this
-    -- fallback for unusual setups.
+    -- Allow alternate library filename casing.
     pluginLib = path.join(sdkDir, "output/lib/plugin.lib")
 end
 
@@ -58,7 +53,6 @@ project "CameraResponse"
     files {
         path.join(rootDir, "source/**.h"),
         path.join(rootDir, "source/**.hpp"),
-        path.join(rootDir, "source/**.inc"),
         path.join(rootDir, "source/**.cpp"),
         path.join(rootDir, "source/**.rc")
     }
@@ -98,13 +92,8 @@ project "CameraResponse"
 
     filter "action:vs*"
         systemversion "latest"
-        -- /MP is the MSVC compiler switch for parallel compilation.
-        -- Use a normal build option instead of Premake helper APIs that
-        -- are not present in every premake5 build.
-        -- Current pinned plugin-sdk uses C++20 concepts in injector and
-        -- std::expected in SafetyHook, which requires the C++23/latest
-        -- MSVC language mode. Use the compiler switch directly so this
-        -- remains compatible with older bundled Premake executables.
+        -- /std:c++latest is required by pinned plugin-sdk/SafetyHook; /MP enables parallel builds.
+        -- Direct switches avoid newer Premake API dependencies.
         buildoptions { "/std:c++latest", "/Zc:__cplusplus", "/GS", "/sdl", "/MP" }
         linkoptions { "/DYNAMICBASE", "/NXCOMPAT" }
 
@@ -115,10 +104,7 @@ project "CameraResponse"
     filter "configurations:Release"
         optimize "Speed"
         symbols "Off"
-        -- Reduce binary surface and make release output deterministic.
-        -- /Gy + /Gw split functions/data into COMDATs; /OPT:REF and /OPT:ICF
-        -- discard/merge unused code. /Brepro avoids timestamp-driven binary
-        -- changes that can hurt reputation-based AV heuristics.
+        -- Split/strip unused COMDATs; /Brepro makes release output reproducible.
         buildoptions { "/Gy", "/Gw", "/GL", "/Brepro" }
         linkoptions { "/LTCG", "/OPT:REF", "/OPT:ICF", "/Brepro", "/INCREMENTAL:NO", "/RELEASE" }
 

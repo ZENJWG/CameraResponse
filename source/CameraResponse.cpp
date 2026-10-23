@@ -1,18 +1,8 @@
-// GTASA: Camera Response v0.9 | Created by Zeneric | Inspired by MachineGames
-// Made by Zeneric
-// Public version: 1.0
-// Safety revision: translation-first camera commit; optional validated local orientation is INI-gated.
-// GTA San Andreas Classic PC US 1.0, x86
-// DK22Pac/plugin-sdk tested baseline: a1df3a6 (Win32 / GTA SA Classic 1.0 US)
-//
-// v1.0 extends the layered camera feature set with a dedicated vehicle camera system: locomotion, directional
-// inertia, footsteps/surfaces, jump/landing, damage, explosions, melee,
-// per-weapon recoil, presets and optional debug overlay.
-// It patches the US 1.0 call at 0x52C98B to CopyCameraMatrixToRWCam.
-// The plugin offsets CCamera::m_mCameraMatrix only for that copy, then
-// restores it immediately so GTA's internal camera smoothing stays stock.
-//
-// Log = CameraResponse.log beside CameraResponse.asi
+// Camera Response v1.0 | Zeneric | Inspired by MachineGames
+// GTA San Andreas Classic US 1.0 (x86); plugin-sdk baseline a1df3a6.
+// Camera hook: CALL 0x52C98B -> CopyCameraMatrixToRWCam; restore GTA's matrix after copying.
+// Translation by default; optional validated rotation modifies RenderWare only.
+// Startup log beside the ASI (or in %TEMP% if the ASI folder is read-only).
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -39,6 +29,7 @@
 #include "CPedIntelligence.h"
 #include "CPad.h"
 #include "CTimer.h"
+#include "CMenuManager.h"
 #include "CWorld.h"
 #include "CWeather.h"
 #include "CColPoint.h"
@@ -47,10 +38,8 @@
 #include "common.h"
 #include "injector.hpp"
 #include "ResponseCore.h"
-#include "IniValue.h"
-#include "ConfigReload.h"
-#include "ScanProfiler.h"
-#include "CameraHookGuard.h"
+#include "UpdateDispatch.h"
+#include "OverlayLayout.h"
 #include "CameraResponseAPI.h"
 
 #include <cmath>
@@ -148,7 +137,7 @@ static bool ApplyLocalRwRotation(
         up = RotateRwAroundAxis(up, at, roll);
     }
 
-    // Rebuild an orthonormal basis to avoid cumulative scale/shear drift.
+    // Re-orthonormalize to prevent rotation-induced scale/shear drift.
     if (!NormalizeRw(at) || !NormalizeRw(up))
         return false;
     right = CrossRw(up, at);
@@ -183,8 +172,7 @@ struct Spring1D {
     }
 
     void Update(float dt, float k, float damping, float target = 0.0f) {
-        // Semi-implicit Euler with bounded substeps keeps spring response
-        // consistent when GTA's timestep spikes at low/variable frame rates.
+        // Bounded semi-implicit substeps stabilize springs across frame-time spikes.
         float remaining = Clamp(dt, 0.0f, 0.050f);
         while (remaining > 0.000001f) {
             const float h = std::min(remaining, 0.010f);
@@ -245,21 +233,33 @@ public:
         Close();
     }
 
-    void Init(const std::string& dir, bool enabled) {
+    void Init(const std::string& dir, bool verbose) {
         Close();
-        enabled_ = enabled && !dir.empty();
+        enabled_ = verbose && !dir.empty();
         path_ = dir.empty() ? std::string() : dir + "CameraResponse.log";
 
-        if (!enabled_)
+        if (path_.empty())
             return;
 
+        // A minimal startup log is always written, even when verbose logs are off.
         Open("w");
-        if (!file_)
+        if (!file_) {
+            char tempDir[MAX_PATH + 1] = {};
+            const DWORD length = GetTempPathA(MAX_PATH, tempDir);
+            if (length > 0 && length < MAX_PATH) {
+                path_ = std::string(tempDir) + "CameraResponse.log";
+                Open("w");
+            }
+        }
+
+        if (!file_) {
+            OutputDebugStringA("CameraResponse: unable to open startup log in ASI folder or TEMP.\n");
             return;
+        }
 
         std::fprintf(
             file_,
-            "GTASA: Camera Response v0.9 | Created by Zeneric | Inspired by MachineGames debug log\r\n"
+            "GTASA: Camera Response | startup diagnostic\r\n"
             "------------------------------------------------------------\r\n"
         );
         std::fflush(file_);
@@ -270,27 +270,43 @@ public:
         return enabled_;
     }
 
+    const std::string& Path() const {
+        return path_;
+    }
+
     void Flush() {
         if (file_)
             std::fflush(file_);
     }
 
+    // Normal logging remains opt-in to avoid per-frame log overhead.
     void Write(const char* fmt, ...) {
         if (!enabled_)
             return;
+        va_list ap;
+        va_start(ap, fmt);
+        WriteV(fmt, ap);
+        va_end(ap);
+    }
 
+    // Small startup/failure records are written without requiring Debug.Enabled=1.
+    void WriteImportant(const char* fmt, ...) {
+        va_list ap;
+        va_start(ap, fmt);
+        WriteV(fmt, ap);
+        va_end(ap);
+        Flush();
+    }
+
+private:
+    void WriteV(const char* fmt, va_list ap) {
         if (!file_)
             Open("a");
         if (!file_)
             return;
 
         std::fprintf(file_, "[%10lu] ", static_cast<unsigned long>(GetTickCount()));
-
-        va_list ap;
-        va_start(ap, fmt);
         std::vfprintf(file_, fmt, ap);
-        va_end(ap);
-
         std::fprintf(file_, "\r\n");
 
         const DWORD now = GetTickCount();
@@ -300,7 +316,6 @@ public:
         }
     }
 
-private:
     void Open(const char* mode) {
         if (file_ || path_.empty())
             return;
@@ -327,13 +342,1870 @@ private:
     DWORD lastFlushTick_ = 0;
 };
 
-// Runtime path anchor. Taking the address of this non-inline function gives
-// GetModuleHandleEx a code address that is guaranteed to belong to
-// CameraResponse.asi, independent of the GTA directory or modloader layout.
+
+// Use an address inside this ASI to locate its path, independent of modloader/GTA paths.
 static void CameraResponseModuleAnchor() {
 }
 
-#include "CameraResponseConfig.inc"
+struct Config {
+    bool enabled = true;
+    float strength = 1.0f;
+    float presetScale = 1.0f;
+
+    float masterOverallScale = 1.0f;
+    float masterMovementScale = 1.0f;
+    float masterCombatScale = 1.0f;
+    float masterVehicleScale = 1.0f;
+    float masterWorldScale = 1.0f;
+    float masterFovScale = 1.0f;
+
+    bool contextAttenuationEnabled = true;
+    float contextIndoorScale = 0.82f;
+    float contextAimScale = 0.78f;
+    float contextCrouchScale = 0.88f;
+    float contextLowHealthScale = 0.82f;
+    float contextLowHealthThreshold = 35.0f;
+    float contextScriptedScale = 0.0f;
+    unsigned contextIndoorScanMs = 250;
+    float contextIndoorCeilingHeight = 8.0f;
+
+    bool directionalResponseEnabled = true;
+    float directionalSourceSide = 1.00f;
+    float directionalSourceForward = 1.00f;
+    float directionalSourceVertical = 0.30f;
+    float directionalDoorScale = 1.00f;
+    float directionalWaterScale = 0.80f;
+    float directionalVehicleTransitionScale = 0.70f;
+    float directionalSwimScale = 0.55f;
+    float directionalParachuteScale = 0.80f;
+    float directionalLargeVehicleScale = 0.90f;
+
+    bool responseBudgetEnabled = true;
+    float responseBudgetNormalized = 1.12f;
+    float responseBudgetCriticalReserve = 0.22f;
+    float responseBudgetSoftness = 0.65f;
+    bool ambientDuckingEnabled = true;
+    float ambientDuckAttack = 18.0f;
+    float ambientDuckRelease = 5.5f;
+    float ambientDuckMinimum = 0.28f;
+    unsigned ambientDuckHoldMs = 260;
+
+    bool directionalRotationEnabled = true;
+    float directionalRotationRollDeg = 0.75f;
+    float directionalRotationPitchDeg = 0.55f;
+    float directionalRotationYawDeg = 0.18f;
+    float directionalRotationSpring = 38.0f;
+    float directionalRotationDamping = 12.5f;
+
+    bool jerkResponseEnabled = true;
+    float playerJerkStrength = 0.0065f;
+    float vehicleJerkStrength = 0.0100f;
+    float jerkDeadzone = 4.5f;
+    float jerkMax = 22.0f;
+
+    float nearbyApproachInfluence = 0.70f;
+    float nearbyPassInfluence = 0.55f;
+    float rotorWashDistance = 24.0f;
+    float rotorWashHeight = 18.0f;
+    float rotorWashStrength = 0.040f;
+
+    float explosionPressureIndoorScale = 0.72f;
+    float explosionPressureBelowBoost = 0.45f;
+    float explosionPressureAboveScale = 0.72f;
+    float explosionPressureLateralRoll = 0.65f;
+
+    float footstepSurfaceBandStrength = 0.024f;
+
+    bool sourceWatchdogEnabled = true;
+    unsigned sourceReleaseMs = 650;
+    unsigned sourceContinuousMaxMs = 3500;
+    unsigned globalTailMs = 3200;
+    float stuckSpringEpsilon = 0.003f;
+    char presetName[32] = "Default";
+    bool comfortPreset = false;
+
+    // Presets multiply user gains rather than overriding per-feature tuning.
+    float presetMovement = 1.0f;
+    float presetCombat = 1.0f;
+    float presetVehicle = 1.0f;
+    float presetWorld = 1.0f;
+    float presetFov = 1.0f;
+    float presetAmbient = 1.0f;
+    float presetImpact = 1.0f;
+    float presetRecoil = 1.0f;
+    float presetMelee = 1.0f;
+    float presetLanding = 1.0f;
+    float presetRotation = 1.0f;
+    float presetRecovery = 1.0f;
+    float idleScale = 1.0f;
+    float walkScale = 1.0f;
+    float runScale = 1.15f;
+    float sprintScale = 1.30f;
+    float aimScale = 0.38f;
+    float crouchScale = 0.72f;
+    float airborneScale = 0.30f;
+
+    // Ignore near-zero velocity noise while visually stationary.
+    float movementDeadzone = 0.012f;
+
+    bool locomotionEnabled = true;
+    bool footstepsEnabled = true;
+    bool inertiaEnabled = true;
+    bool jumpLandEnabled = true;
+    bool damageEnabled = true;
+    bool explosionsEnabled = true;
+
+    // NPC shots produce distance-scaled impulses, separate from player recoil.
+    bool nearbyGunfireEnabled = true;
+    bool nearbyGunfireInVehicle = true;
+    float nearbyGunfireStrength = 0.22f;
+    float nearbyGunfireMinDistance = 2.0f;
+    float nearbyGunfireMaxDistance = 45.0f;
+    float nearbyGunfireFalloffPower = 1.35f;
+    float nearbyGunfireSide = 0.55f;
+    float nearbyGunfireVertical = 1.0f;
+    float nearbyGunfireForward = 0.35f;
+    unsigned nearbyGunfireMaxResponseShotsPerFrame = 4;
+    unsigned nearbyGunfireScanMs = 12;
+
+    // Nearby vehicles add subtle motion; exclude the player's own vehicle.
+    bool nearbyVehiclesEnabled = true;
+    bool nearbyVehiclesOnFoot = true;
+    bool nearbyVehiclesInVehicle = true;
+    float nearbyVehiclesStrength = 0.004f;
+    float nearbyVehiclesMinDistance = 2.5f;
+    float nearbyVehiclesMaxDistance = 38.0f;
+    float nearbyVehiclesFalloffPower = 1.45f;
+    float nearbyVehiclesIdleScale = 0.30f;
+    float nearbyVehiclesLowSpeedScale = 0.55f;
+    float nearbyVehiclesHighSpeedScale = 1.00f;
+    float nearbyVehiclesAccelerationScale = 0.45f;
+    float nearbyVehiclesVertical = 1.00f;
+    float nearbyVehiclesSide = 0.42f;
+    float nearbyVehiclesForward = 0.28f;
+    float nearbyVehiclesMaxCombined = 0.030f;
+    unsigned nearbyVehiclesMaxContributors = 12;
+
+    bool doorResponseEnabled = true;
+    bool vehicleDoorResponseEnabled = true;
+    bool buildingDoorResponseEnabled = true;
+    bool doorResponseInVehicle = true;
+    float doorResponseStrength = 0.145f;
+    float vehicleDoorStrength = 1.00f;
+    float buildingDoorStrength = 0.85f;
+    float doorResponseMinDistance = 0.35f;
+    float doorResponseMaxDistance = 22.0f;
+    float doorResponseFalloffPower = 1.25f;
+    float doorResponseSide = 0.42f;
+    float doorResponseVertical = 1.00f;
+    float doorResponseForward = 0.62f;
+    float doorVehicleOwnScale = 1.20f;
+    float vehicleDoorCloseThreshold = 0.020f;
+    float vehicleDoorWasOpenThreshold = 0.120f;
+    unsigned doorScanMs = 25;
+    float doorBonnetScale = 1.35f;
+    float doorBootScale = 1.45f;
+
+    bool vehicleMechanicalEnabled = true;
+    float vehicleEnterStrength = 0.34f;
+    float vehicleExitStrength = 0.26f;
+    bool vehicleBailOutEnabled = true;
+    float vehicleBailOutMinSpeed = 0.20f;
+    float vehicleBailOutStrength = 0.62f;
+    unsigned vehicleBailAirborneWindowMs = 500;
+    float vehicleBailLandingScale = 1.45f;
+    float vehicleBailFovKick = -0.018f;
+    float engineStartStrength = 0.32f;
+    float engineStopStrength = 0.18f;
+    float gearShiftStrength = 0.20f;
+    float engineRpmVibration = 0.010f;
+    float engineRpmMinHz = 5.5f;
+    float engineRpmMaxHz = 15.5f;
+    float engineLoadInfluence = 0.55f;
+    float bikeEngineScale = 1.45f;
+    float gearShiftCarScale = 1.00f;
+    float gearShiftBikeScale = 1.35f;
+    float gearShiftPulseRecovery = 0.70f;
+    float tyreBlowoutStrength = 0.72f;
+    float axleLandingStrength = 0.82f;
+
+    bool waterResponseEnabled = true;
+    float waterEntryStrength = 0.48f;
+
+    bool largeVehicleResponseEnabled = true;
+    float trainResponseStrength = 0.022f;
+    float trainResponseDistance = 48.0f;
+    float aircraftResponseStrength = 0.016f;
+    float aircraftResponseDistance = 42.0f;
+    unsigned aircraftMaxContinuousMs = 2600;
+    unsigned aircraftRearmMs = 1200;
+    unsigned largeVehicleScanMs = 80;
+
+    bool worldObjectResponseEnabled = true;
+    float worldObjectImpactStrength = 0.22f;
+    float worldObjectImpactDistance = 28.0f;
+    unsigned worldObjectScanMs = 67;
+    unsigned worldObjectContactReleaseMs = 320;
+    unsigned worldObjectImpactCooldownMs = 360;
+    float worldObjectReimpactDeltaV = 0.080f;
+    float worldObjectReimpactDamageRise = 1.50f;
+
+    bool pedWorldResponseEnabled = true;
+    float pedImpactStrength = 0.18f;
+    float heavyFootstepStrength = 0.030f;
+    float heavyFootstepDistance = 8.0f;
+    unsigned pedWorldScanMs = 50;
+
+    bool weatherResponseEnabled = true;
+    float windResponseStrength = 0.010f;
+    float rainResponseStrength = 0.006f;
+    float sandstormResponseStrength = 0.016f;
+    float earthquakeResponseStrength = 0.095f;
+
+    float weatherSmoothing = 2.80f;
+    float windGustStrength = 0.42f;
+    float windGustRate = 0.85f;
+    float rainTextureRate = 13.0f;
+    float rainVerticalBias = 0.72f;
+    float sandstormLowFrequency = 0.70f;
+    float earthquakeMaxOffset = 0.070f;
+    float weatherMaxAmbient = 0.075f;
+
+    bool obstructionResponseEnabled = true;
+    float obstructionThreshold = 0.055f;
+    float obstructionStrength = 0.70f;
+    float obstructionSpring = 34.0f;
+    float obstructionDamping = 11.0f;
+
+    bool environmentPriorityMixEnabled = true;
+    float environmentMixMaxImpulse = 1.25f;
+
+    bool vehiclePersonalityEnabled = true;
+    float collisionMaterialInfluence = 0.45f;
+
+    bool advancedResponseEnabled = true;
+    float reloadResponseStrength = 0.18f;
+    float equipResponseStrength = 0.13f;
+    bool nearMissEnabled = true;
+    float nearMissStrength = 0.16f;
+    float nearMissDistance = 2.25f;
+    float nearMissMaxShooterDistance = 55.0f;
+
+    float swimResponseStrength = 0.060f;
+    float climbResponseStrength = 0.22f;
+    float parachuteDeployStrength = 0.55f;
+    float parachuteAirStrength = 0.020f;
+    float parachuteLandStrength = 0.42f;
+    float jetpackStrength = 0.036f;
+    float jetpackTransitionStrength = 0.24f;
+    float jetpackRecoilScale = 2.20f;
+    bool mountedWeaponResponseEnabled = true;
+    float mountedGunStrength = 0.045f;
+    float mountedHeavyStrength = 0.100f;
+    float mountedWaterStrength = 0.022f;
+
+    bool jetpackDirectionalEnabled = true;
+    float jetpackDirectionalStrength = 0.160f;
+    float jetpackForwardScale = 1.00f;
+    float jetpackBackwardScale = 0.82f;
+    float jetpackSideScale = 0.92f;
+    float jetpackVerticalScale = 0.72f;
+    float jetpackAccelInfluence = 1.00f;
+    float jetpackVelocityInfluence = 0.34f;
+    float jetpackHoverVibration = 0.0070f;
+    float jetpackHoverHz = 8.5f;
+    float jetpackSmoothing = 8.5f;
+    float jetpackMaxSide = 0.075f;
+    float jetpackMaxVertical = 0.085f;
+    float jetpackMaxForward = 0.085f;
+
+    float bikeLeanStrength = 0.070f;
+    float bikePitchStrength = 0.060f;
+    float bicyclePedalStrength = 0.026f;
+    float boatWaveStrength = 0.085f;
+
+    bool boatWavePhysicalEnabled = true;
+    float boatWaveHeaveScale = 0.055f;
+    float boatWavePitchScale = 0.070f;
+    float boatWaveRollScale = 0.060f;
+    float boatWaveOrientationHold = 0.018f;
+    float boatWaveSpeedInfluence = 0.55f;
+    float boatWaveSmoothing = 7.5f;
+    float boatWaveSlamThreshold = 2.20f;
+    float boatWaveSlamStrength = 0.105f;
+    unsigned boatWaveSlamCooldownMs = 180;
+    float boatWaveRotationPitchDeg = 0.85f;
+    float boatWaveRotationRollDeg = 1.05f;
+    float boatWaveMaxSide = 0.070f;
+    float boatWaveMaxVertical = 0.100f;
+    float boatWaveMaxForward = 0.085f;
+
+    float aircraftTurbulenceStrength = 0.024f;
+    float aircraftLandingStrength = 0.60f;
+
+    bool aircraftPhysicalEnabled = true;
+    float aircraftAccelSideScale = 0.020f;
+    float aircraftAccelForwardScale = 0.018f;
+    float aircraftAccelVerticalScale = 0.015f;
+    float aircraftAttitudeHold = 0.030f;
+    float aircraftSmoothing = 7.5f;
+    float aircraftWeatherInfluence = 0.90f;
+    float aircraftPlaneTurbulenceScale = 0.90f;
+    float aircraftHeliTurbulenceScale = 1.15f;
+    float aircraftHeliRotorVibration = 0.0065f;
+    float aircraftPlaneAirframeVibration = 0.0040f;
+    float aircraftRotationPitchDeg = 1.10f;
+    float aircraftRotationRollDeg = 1.35f;
+    float aircraftTouchdownThreshold = 0.035f;
+    float aircraftTouchdownForwardScale = 0.28f;
+    float aircraftMaxSide = 0.090f;
+    float aircraftMaxVertical = 0.095f;
+    float aircraftMaxForward = 0.090f;
+    float trainJointStrength = 0.018f;
+    float skidStrength = 0.040f;
+    float engineVibrationStrength = 0.012f;
+    float roadTextureStrength = 0.014f;
+
+    float doorOpenStrength = 0.32f;
+    float machineryStrength = 0.016f;
+    float machineryDistance = 24.0f;
+    float nativeShakeBlend = 0.0f;
+    unsigned nativeShakeMaxContinuousMs = 900;
+    unsigned nativeShakeRearmMs = 250;
+    float nativeShakeChangeEpsilon = 0.002f;
+
+    bool explosionShockDelayEnabled = true;
+    float explosionShockSpeed = 343.0f;
+    float explosionShockSecondaryScale = 0.38f;
+    bool explosionOcclusionEnabled = true;
+    float explosionOccludedScale = 0.55f;
+
+    bool impactSequencingEnabled = true;
+    unsigned impactSequenceResetMs = 420;
+    float impactSecondaryScale = 0.82f;
+    float impactTertiaryScale = 0.68f;
+
+    // HighFrequency=0 suppresses vibration without removing larger body motion.
+    float locomotionResponseScale = 1.0f;
+    float combatResponseScale = 1.0f;
+    float vehicleResponseScale = 1.0f;
+    float environmentResponseScale = 1.0f;
+    float highFrequencyScale = 1.0f;
+
+    bool frequencyBandsEnabled = true;
+    float lowFrequencyScale = 1.0f;
+    float midFrequencyScale = 1.0f;
+    float highFrequencyBandScale = 1.0f;
+    bool proceduralNoiseEnabled = true;
+    float proceduralNoiseMix = 0.42f;
+
+    bool rotationEnabled = false;
+    float rotationSafetyScale = 0.65f;
+    float explosionPitchDeg = 1.25f;
+    float explosionRollDeg = 1.60f;
+    float explosionYawDeg = 0.30f;
+    float explosionRotationSpring = 34.0f;
+    float explosionRotationDamping = 11.5f;
+
+    bool fovEnabled = true;
+    bool fovPreferWidescreenFix = true;
+    bool fovNativeFallback = true;
+    float fovMinMultiplier = 0.90f;
+    float fovMaxMultiplier = 1.12f;
+    float fovResponse = 9.0f;
+    float fovReturnResponse = 6.0f;
+    float fovKickDecay = 7.5f;
+    float fovWalk = 0.002f;
+    float fovRun = 0.008f;
+    float fovSprint = 0.020f;
+    float fovCrouch = -0.005f;
+    float fovAim = -0.018f;
+    float fovAirborne = 0.009f;
+    float fovVehicleSpeed = 0.055f;
+    float fovVehicleAccel = 0.014f;
+    float fovVehicleBrake = -0.010f;
+    float fovVehicleCorner = 0.009f;
+    float fovRecoilKick = 0.006f;
+    float fovMeleeKick = 0.008f;
+    float fovDamageKick = -0.018f;
+    float fovExplosionKick = -0.030f;
+    float fovLandingKick = -0.016f;
+    float fovVehicleImpactKick = -0.022f;
+    float fovChainsawAttack = 0.006f;
+    float fovChainsawSaw = 0.012f;
+    float fovContinuousTool = 0.004f;
+
+    bool directionalDamageEnabled = true;
+    float directionalDamageWeight = 0.85f;
+    float incomingMeleeDamageScale = 1.35f;
+    float incomingBulletDamageScale = 1.15f;
+    float incomingBulletMidPunch = 0.085f;
+    float incomingBulletSnap = 0.095f;
+    float incomingBulletRecovery = 0.72f;
+    float incomingExplosiveDamageScale = 1.55f;
+    float incomingOtherDamageScale = 1.00f;
+    float incomingDamageMinSeverity = 0.24f;
+    float incomingDamageHighSnap = 0.055f;
+    bool npcBulletHitFallbackEnabled = false;
+    float npcBulletHitRadius = 0.42f;
+    float npcBulletHitFallbackScale = 1.00f;
+    unsigned npcBulletHitFallbackCooldownMs = 150;
+
+    bool cameraOffsetCollisionEnabled = true;
+    float cameraOffsetCollisionPadding = 0.035f;
+
+    bool detailedMeleeWeapons = true;
+    float batSwingScale = 1.00f;
+    float knifeSwingScale = 0.58f;
+    float meleeWeaponScale[16] = {};
+    float meleeWeaponSideWeight[16] = {};
+    float meleeWeaponVerticalWeight[16] = {};
+    float meleeWeaponReleaseForward[16] = {};
+    float meleeWeaponReleaseSide[16] = {};
+    float meleeWeaponContactScale[16] = {};
+    float meleeWeaponLockOnScale[16] = {};
+    unsigned meleeWeaponCooldownMs[16] = {};
+
+    float chainsawVibration = 0.028f;
+    float chainsawIdleVibration = 0.006f;
+    float chainsawAttackVibration = 0.020f;
+    float chainsawSawVibration = 0.040f;
+    float chainsawIdleHz = 11.0f;
+    float chainsawAttackHz = 22.0f;
+    float chainsawSawHz = 34.0f;
+    float chainsawForwardLoad = 0.030f;
+    float chainsawContactHoldMs = 150.0f;
+    float continuousToolVibration = 0.010f;
+    float heavyMeleeScale = 1.20f;
+
+    bool contextualRecoilEnabled = true;
+    float recoilCrouchScale = 0.84f;
+    float recoilAimScale = 0.90f;
+    float recoilMovingScale = 1.10f;
+    float recoilDualWieldScale = 1.08f;
+
+    bool reloadAnimationResponse = true;
+    float reloadInsertScale = 0.65f;
+    float reloadActionScale = 1.00f;
+
+    bool wheelResponseEnabled = true;
+    float wheelCompressionStrength = 0.40f;
+    float tractionLossStrength = 0.045f;
+    float tractionRegainStrength = 0.16f;
+
+    bool runtimeReloadEnabled = false;
+    int runtimeReloadKey = VK_F10;
+    unsigned runtimeReloadDebounceMs = 350;
+    bool detailedDebugHud = true;
+
+    bool transitionsEnabled = true;
+    bool meleeEnabled = true;
+    bool breathingEnabled = true;
+    bool surfaceStepsEnabled = true;
+
+    // Idle drift in camera-local units.
+    float idleSide = 0.0450f;
+    float idleVertical = 0.0550f;
+    float idleForward = 0.0150f;
+
+    // Reduce procedural idle motion after sustained stillness.
+    float idleSettleDelay = 0.80f;
+    float idleSettledScale = 0.0f;
+    float aimBreathingSide = 0.010f;
+    float aimBreathingVertical = 0.016f;
+    float aimBreathingForward = 0.006f;
+    float aimBreathingRate = 0.82f;
+
+    float gaitSide = 0.0900f;
+    float gaitVertical = 0.1200f;
+    float gaitForward = 0.0300f;
+    float fallbackGait = 0.18f;
+    float stepImpulse = 0.48f;
+    float surfaceRoad = 1.00f;
+    float surfaceConcrete = 1.04f;
+    float surfaceGravel = 1.12f;
+    float surfaceGrass = 0.78f;
+    float surfaceDirt = 0.86f;
+    float surfaceSand = 0.72f;
+    float surfaceWood = 1.02f;
+    float surfaceMetal = 1.16f;
+    float surfaceRock = 1.08f;
+    float surfaceMisc = 0.95f;
+
+    float lookYaw = 1.0f;
+    float lookPitch = 1.0f;
+    float turnInput = 0.75f;
+    float accelInertia = 0.80f;
+    float directionalInertia = 1.0f;
+    float strafeSway = 0.060f;
+    float backwardSway = 0.035f;
+    float jumpImpulse = 0.42f;
+    float landingImpulse = 0.78f;
+    float hardLandingScale = 1.35f;
+    float landingSurfaceInfluence = 0.65f;
+    float landingSoftMinScale = 0.72f;
+    float landingHardMaxScale = 1.30f;
+    float damageImpulse = 0.68f;
+    float damageSideImpulse = 0.30f;
+    float explosionImpulse = 1.05f;
+    float explosionRadius = 28.0f;
+    float maxImpactOffset = 0.34f;
+    float maxFinalSide = 0.32f;
+    float maxFinalVertical = 0.42f;
+    float maxFinalForward = 0.22f;
+    float meleeImpact = 0.42f;
+    float meleeSide = 0.12f;
+
+    // Use live fight-task animation phase, not raw attack input.
+    bool detailedPlayerMelee = true;
+    float punchWindup = 0.120f;
+    float punchRelease = 0.520f;
+    float punchContact = 0.300f;
+    float punchSide = 0.110f;
+    float punchVertical = 0.080f;
+    float punchReleasePhase = 0.34f;
+    float kickWindup = 0.190f;
+    float kickRelease = 0.780f;
+    float kickContact = 0.460f;
+    float kickSide = 0.145f;
+    float kickVertical = 0.210f;
+    float kickReleasePhase = 0.40f;
+    float meleeComboStep = 0.060f;
+    float meleeComboMaxScale = 1.22f;
+
+    float idlePitchDeg = 0.22f;
+    float idleRollDeg = 0.20f;
+    float gaitPitchDeg = 0.52f;
+    float gaitRollDeg = 0.62f;
+    float turnRollDeg = 0.85f;
+    float lookYawDeg = 0.38f;
+    float lookPitchDeg = 0.42f;
+    float maxPitchDeg = 1.75f;
+    float maxRollDeg = 2.00f;
+    float maxYawDeg = 1.10f;
+
+    // Vehicle response uses independent, translation-only motion.
+    bool vehicleEnabled = true;
+    float vehicleStrength = 1.0f;
+    float vehicleAccelForward = 1.05f;
+    float vehicleBrakeForward = 1.40f;
+    float vehicleCornerSide = 0.92f;
+    float vehicleVerticalAccel = 0.72f;
+    float vehicleSpeedVibration = 0.022f;
+    float vehicleSpeedVibrationRate = 5.6f;
+
+    // Read actual horn playback (m_nHornCounter), including scripted horns.
+    bool vehicleHornEnabled = true;
+    float vehicleHornVibration = 0.012f;
+    float vehicleHornVibrationRate = 11.5f;
+    float vehicleHornAttack = 18.0f;
+    float vehicleHornRelease = 10.0f;
+
+    float vehicleImpactThreshold = 7.5f;
+    float vehicleImpactImpulse = 0.72f;
+
+    bool vehicleContactResponseEnabled = true;
+    float vehicleContactStrength = 1.00f;
+    float vehicleContactMinSpeed = 0.015f;
+    float vehicleContactDeltaVelocityThreshold = 0.0075f;
+    float vehicleContactStrongDeltaVelocity = 0.030f;
+    float vehicleContactDamageReference = 45.0f;
+    float vehicleContactSpring = 38.0f;
+    float vehicleContactDamping = 10.5f;
+    float vehicleContactDirectKick = 0.115f;
+    float vehicleContactKickDecay = 18.0f;
+    unsigned vehicleContactCooldownMs = 140;
+
+    // Reinforce a physics collision only with matching health loss; exclude fire/bullets.
+    bool vehicleCrashDamageEnabled = true;
+    float vehicleCrashDamageThreshold = 2.0f;
+    float vehicleCrashDamageReference = 120.0f;
+    float vehicleCrashDamageStrength = 0.90f;
+    float vehicleCrashFrontMultiplier = 1.15f;
+    float vehicleCrashRearMultiplier = 0.85f;
+    float vehicleCrashSideMultiplier = 1.00f;
+    float vehicleCrashVerticalMultiplier = 0.75f;
+    float vehicleCrashCatastrophicThreshold = 180.0f;
+    float vehicleCrashCatastrophicMultiplier = 1.40f;
+    unsigned vehicleCrashPhysicsWindowMs = 180;
+
+    // Suspension: 0=compressed, 1=relaxed; fast compression adds curb/landing response.
+    bool vehicleSuspensionEnabled = true;
+    float vehicleSuspensionThreshold = 0.16f;
+    float vehicleSuspensionStrength = 0.35f;
+    bool vehicleSuspensionAdaptiveHandling = true;
+    float vehicleSuspensionHandlingInfluence = 1.00f;
+
+    float vehicleSpring = 20.0f;
+    float vehicleDamping = 7.4f;
+    float vehicleMaxSide = 0.26f;
+    float vehicleMaxVertical = 0.32f;
+    float vehicleMaxForward = 0.24f;
+    float vehicleAutomobileScale = 1.00f;
+    float vehicleBikeScale = 1.20f;
+    float vehicleBoatScale = 0.82f;
+    float vehicleHeliScale = 0.72f;
+    float vehiclePlaneScale = 0.62f;
+    float vehicleOtherScale = 0.85f;
+
+    bool recoilEnabled = true;
+    float recoilStrength = 1.00f;
+
+    // Recoil bypasses aim damping; impulses use camera-local units.
+    float recoilVerticalKick = 0.145f;
+    float recoilForwardKick = 0.060f;
+    float recoilSideKick = 0.020f;
+
+    // Recoil displacement hits immediately; velocity creates the damped follow-through.
+    float recoilPositionVertical = 0.055f;
+    float recoilPositionForward = 0.024f;
+    float recoilPositionSide = 0.008f;
+    float recoilVelocityVertical = 0.85f;
+    float recoilVelocityForward = 0.32f;
+    float recoilVelocitySide = 0.10f;
+    unsigned recoilMinIntervalMs = 20;
+    float recoilPistol = 0.82f;
+    float recoilDeagle = 1.18f;
+    float recoilSmg = 0.62f;
+    float recoilRifle = 0.82f;
+    float recoilShotgun = 1.28f;
+    float recoilSniper = 1.05f;
+    float recoilLauncher = 1.55f;
+    float recoilFlamethrower = 0.30f;
+    float recoilMinigun = 0.42f;
+    float firstShotMultiplier = 1.18f;
+    float sustainedShotMultiplier = 0.90f;
+    unsigned sustainedResetMs = 240;
+    float weaponScale[47] = {};
+    float weaponVertical[47] = {};
+    float weaponForward[47] = {};
+    float weaponSide[47] = {};
+    float weaponRecovery[47] = {};
+
+    float spring = 26.0f;
+    float damping = 9.0f;
+    float lookSpring = 48.0f;
+    float lookDamping = 13.5f;
+    float stateResponse = 4.8f;
+    float footPhaseResponse = 11.0f;
+
+    // Use faster recoil recovery than for heavy landing/explosion springs.
+    float recoilSpringMultiplier = 1.75f;
+    float recoilDampingMultiplier = 1.75f;
+    float idleDampingMultiplier = 1.65f;
+
+    bool debug = false;
+    unsigned logEveryMs = 700;
+    bool logSteps = false;
+    bool logShots = false;
+    bool overlayEnabled = false;
+    float overlayScale = 1.0f;
+
+    bool auditEnabled = false;
+    bool auditConfigValues = true;
+    bool auditFunctionCalls = true;
+    unsigned auditEveryMs = 5000;
+
+    unsigned nearbyVehicleScanMs = 33;
+    unsigned surfaceScanMs = 80;
+
+    std::string dir;
+    std::string iniPath;
+
+    static std::string ModuleDirectory() {
+        HMODULE module = nullptr;
+
+        // Resolve paths against this ASI, never the game directory.
+        if (!GetModuleHandleExA(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                reinterpret_cast<LPCSTR>(&CameraResponseModuleAnchor),
+                &module) ||
+            !module) {
+            return {};
+        }
+
+        // Support paths longer than MAX_PATH.
+        std::vector<char> path(512, '\0');
+
+        for (;;) {
+            const DWORD length =
+                GetModuleFileNameA(
+                    module,
+                    path.data(),
+                    static_cast<DWORD>(path.size())
+                );
+
+            if (length == 0)
+                return {};
+
+            if (length < path.size() - 1) {
+                std::string result(path.data(), length);
+
+                const auto slash =
+                    result.find_last_of("\\/");
+
+                if (slash == std::string::npos)
+                    return {};
+
+                result.resize(slash + 1);
+                return result;
+            }
+
+            if (path.size() >= 32768)
+                return {};
+
+            path.resize(path.size() * 2, '\0');
+        }
+    }
+
+    static float ReadFloat(
+        const std::string& path,
+        const char* section,
+        const char* key,
+        float fallback
+    ) {
+        char def[64] = {};
+        char value[64] = {};
+
+        std::snprintf(def, sizeof(def), "%.6f", fallback);
+
+        GetPrivateProfileStringA(
+            section,
+            key,
+            def,
+            value,
+            sizeof(value),
+            path.c_str()
+        );
+
+        char* end = nullptr;
+        const float result = std::strtof(value, &end);
+
+        // Reject NaN/Inf before Clamp: unordered comparisons cannot sanitize them.
+        return end && end != value && std::isfinite(result)
+            ? result
+            : fallback;
+    }
+
+    static int ReadInt(
+        const std::string& path,
+        const char* section,
+        const char* key,
+        int fallback
+    ) {
+        return GetPrivateProfileIntA(
+            section,
+            key,
+            fallback,
+            path.c_str()
+        );
+    }
+
+    static bool ReadBool(
+        const std::string& path,
+        const char* section,
+        const char* key,
+        bool fallback
+    ) {
+        return ReadInt(
+            path,
+            section,
+            key,
+            fallback ? 1 : 0
+        ) != 0;
+    }
+
+    static void ReadString(
+        const std::string& path,
+        const char* section,
+        const char* key,
+        const char* fallback,
+        char* out,
+        unsigned outSize
+    ) {
+        GetPrivateProfileStringA(section, key, fallback, out, outSize, path.c_str());
+    }
+
+    void Load() {
+        if (dir.empty())
+            dir = ModuleDirectory();
+
+        // On module lookup failure, do not fall back to the working directory.
+        if (dir.empty()) {
+            iniPath.clear();
+            return;
+        }
+
+        iniPath = dir + "CameraResponse.ini";
+
+        enabled = ReadBool(iniPath, "General", "Enabled", enabled);
+        strength = ReadFloat(iniPath, "General", "Strength", strength);
+
+        masterMovementScale = ReadFloat(iniPath, "MasterTuning", "Movement", masterMovementScale);
+        masterCombatScale = ReadFloat(iniPath, "MasterTuning", "Combat", masterCombatScale);
+        masterVehicleScale = ReadFloat(iniPath, "MasterTuning", "Vehicle", masterVehicleScale);
+        masterWorldScale = ReadFloat(iniPath, "MasterTuning", "World", masterWorldScale);
+        masterFovScale = ReadFloat(iniPath, "MasterTuning", "FOV", masterFovScale);
+
+        contextAttenuationEnabled = ReadBool(iniPath, "ContextAttenuation", "Enabled", contextAttenuationEnabled);
+        contextIndoorScale = ReadFloat(iniPath, "ContextAttenuation", "Indoors", contextIndoorScale);
+        contextAimScale = ReadFloat(iniPath, "ContextAttenuation", "Aiming", contextAimScale);
+        contextCrouchScale = ReadFloat(iniPath, "ContextAttenuation", "Crouching", contextCrouchScale);
+        contextLowHealthScale = ReadFloat(iniPath, "ContextAttenuation", "LowHealth", contextLowHealthScale);
+
+        directionalResponseEnabled = ReadBool(iniPath, "DirectionalResponse", "Enabled", directionalResponseEnabled);
+
+
+        directionalRotationEnabled = ReadBool(iniPath, "DirectionalRotation", "Enabled", directionalRotationEnabled);
+
+        jerkResponseEnabled = ReadBool(iniPath, "JerkResponse", "Enabled", jerkResponseEnabled);
+        playerJerkStrength = ReadFloat(iniPath, "JerkResponse", "PlayerStrength", playerJerkStrength);
+        vehicleJerkStrength = ReadFloat(iniPath, "JerkResponse", "VehicleStrength", vehicleJerkStrength);
+
+
+
+
+        ReadString(iniPath, "General", "Preset", presetName, presetName, sizeof(presetName));
+        comfortPreset = _stricmp(presetName, "Comfort") == 0;
+
+        presetScale = 1.0f;
+        presetMovement = 1.0f;
+        presetCombat = 1.0f;
+        presetVehicle = 1.0f;
+        presetWorld = 1.0f;
+        presetFov = 1.0f;
+        presetAmbient = 1.0f;
+        presetImpact = 1.0f;
+        presetRecoil = 1.0f;
+        presetMelee = 1.0f;
+        presetLanding = 1.0f;
+        presetRotation = 1.0f;
+        presetRecovery = 1.0f;
+
+        if (_stricmp(presetName, "Subtle") == 0) {
+            // Comfort: retain impacts, reduce ambient movement and FOV/rotation.
+            presetScale = 0.82f;
+            presetMovement = 0.78f;
+            presetCombat = 0.88f;
+            presetVehicle = 0.84f;
+            presetWorld = 0.66f;
+            presetFov = 0.58f;
+            presetAmbient = 0.52f;
+            presetImpact = 0.90f;
+            presetRecoil = 0.82f;
+            presetMelee = 0.86f;
+            presetLanding = 0.90f;
+            presetRotation = 0.62f;
+            presetRecovery = 1.18f;
+        } else if (_stricmp(presetName, "Heavy") == 0) {
+            // Heavy: stronger body movement and impacts.
+            presetScale = 1.18f;
+            presetMovement = 1.16f;
+            presetCombat = 1.22f;
+            presetVehicle = 1.26f;
+            presetWorld = 1.12f;
+            presetFov = 1.08f;
+            presetAmbient = 1.08f;
+            presetImpact = 1.30f;
+            presetRecoil = 1.24f;
+            presetMelee = 1.24f;
+            presetLanding = 1.30f;
+            presetRotation = 1.10f;
+            presetRecovery = 0.88f;
+        } else if (_stricmp(presetName, "MachineGames") == 0) {
+            // MachineGames: punchy transients, brisk recovery, restrained ambience.
+            presetScale = 1.08f;
+            presetMovement = 1.02f;
+            presetCombat = 1.30f;
+            presetVehicle = 1.12f;
+            presetWorld = 0.86f;
+            presetFov = 1.18f;
+            presetAmbient = 0.72f;
+            presetImpact = 1.34f;
+            presetRecoil = 1.36f;
+            presetMelee = 1.26f;
+            presetLanding = 1.18f;
+            presetRotation = 1.24f;
+            presetRecovery = 1.20f;
+        } else if (comfortPreset) {
+            presetScale = 0.92f;
+            presetMovement = 0.84f;
+            presetCombat = 0.94f;
+            presetVehicle = 0.88f;
+            presetWorld = 0.72f;
+            presetFov = 0.45f;
+            presetAmbient = 0.0f;
+            presetImpact = 0.94f;
+            presetRecoil = 0.92f;
+            presetMelee = 0.92f;
+            presetLanding = 0.94f;
+            presetRotation = 0.42f;
+            presetRecovery = 1.28f;
+        } else {
+            // Default preset: balanced baseline.
+            presetScale = 1.0f;
+            presetMovement = 1.0f;
+            presetCombat = 1.0f;
+            presetVehicle = 1.0f;
+            presetWorld = 0.92f;
+            presetFov = 0.92f;
+            presetAmbient = 0.86f;
+            presetImpact = 1.0f;
+            presetRecoil = 1.0f;
+            presetMelee = 1.0f;
+            presetLanding = 1.0f;
+            presetRotation = 0.92f;
+            presetRecovery = 1.0f;
+        }
+
+        walkScale = ReadFloat(iniPath, "Movement", "Walk", walkScale);
+        runScale = ReadFloat(iniPath, "Movement", "Run", runScale);
+        sprintScale = ReadFloat(iniPath, "Movement", "Sprint", sprintScale);
+        aimScale = ReadFloat(iniPath, "Movement", "Aim", aimScale);
+        crouchScale = ReadFloat(iniPath, "Movement", "Crouch", crouchScale);
+        airborneScale = ReadFloat(iniPath, "Movement", "Airborne", airborneScale);
+        locomotionEnabled = ReadBool(iniPath, "General", "LocomotionEnabled", locomotionEnabled);
+        footstepsEnabled = ReadBool(iniPath, "General", "FootstepsEnabled", footstepsEnabled);
+        inertiaEnabled = ReadBool(iniPath, "General", "InertiaEnabled", inertiaEnabled);
+        jumpLandEnabled = ReadBool(iniPath, "General", "JumpLandEnabled", jumpLandEnabled);
+        damageEnabled = ReadBool(iniPath, "General", "DamageEnabled", damageEnabled);
+        explosionsEnabled = ReadBool(iniPath, "General", "ExplosionsEnabled", explosionsEnabled);
+        nearbyGunfireEnabled = ReadBool(iniPath, "NearbyGunfire", "Enabled", nearbyGunfireEnabled);
+        nearbyGunfireStrength = ReadFloat(iniPath, "NearbyGunfire", "Strength", nearbyGunfireStrength);
+        nearbyGunfireMaxDistance = ReadFloat(iniPath, "NearbyGunfire", "MaxDistance", nearbyGunfireMaxDistance);
+
+        nearbyVehiclesEnabled = ReadBool(iniPath, "NearbyVehicles", "Enabled", nearbyVehiclesEnabled);
+        nearbyVehiclesStrength = ReadFloat(iniPath, "NearbyVehicles", "Strength", nearbyVehiclesStrength);
+
+        doorResponseEnabled = ReadBool(iniPath, "DoorResponse", "Enabled", doorResponseEnabled);
+        doorResponseStrength = ReadFloat(iniPath, "DoorResponse", "Strength", doorResponseStrength);
+
+        vehicleMechanicalEnabled = ReadBool(iniPath, "ExtendedVehicle", "Enabled", vehicleMechanicalEnabled);
+        vehicleBailOutEnabled = ReadBool(iniPath, "ExtendedVehicle", "BailOutEnabled", vehicleBailOutEnabled);
+        engineRpmVibration = ReadFloat(iniPath, "ExtendedVehicle", "EngineRPMVibration", engineRpmVibration);
+
+        waterResponseEnabled = ReadBool(iniPath, "WorldResponse", "WaterResponse", waterResponseEnabled);
+        largeVehicleResponseEnabled = ReadBool(iniPath, "WorldResponse", "LargeVehicles", largeVehicleResponseEnabled);
+
+        worldObjectResponseEnabled = ReadBool(iniPath, "WorldResponse", "ObjectImpacts", worldObjectResponseEnabled);
+
+        pedWorldResponseEnabled = ReadBool(iniPath, "WorldResponse", "PedImpacts", pedWorldResponseEnabled);
+
+        weatherResponseEnabled = ReadBool(iniPath, "EnvironmentResponse", "Enabled", weatherResponseEnabled);
+        windResponseStrength = ReadFloat(iniPath, "EnvironmentResponse", "WindStrength", windResponseStrength);
+        rainResponseStrength = ReadFloat(iniPath, "EnvironmentResponse", "RainStrength", rainResponseStrength);
+        sandstormResponseStrength = ReadFloat(iniPath, "EnvironmentResponse", "SandstormStrength", sandstormResponseStrength);
+        earthquakeResponseStrength = ReadFloat(iniPath, "EnvironmentResponse", "EarthquakeStrength", earthquakeResponseStrength);
+
+        obstructionResponseEnabled = ReadBool(iniPath, "CameraObstruction", "Enabled", obstructionResponseEnabled);
+
+
+
+        advancedResponseEnabled = ReadBool(iniPath, "AdvancedResponse", "Enabled", advancedResponseEnabled);
+        nearMissEnabled = ReadBool(iniPath, "AdvancedResponse", "NearMiss", nearMissEnabled);
+        nearMissStrength = ReadFloat(iniPath, "AdvancedResponse", "NearMissStrength", nearMissStrength);
+
+        jetpackStrength = ReadFloat(iniPath, "AdvancedResponse", "JetpackStrength", jetpackStrength);
+        jetpackRecoilScale = Clamp(ReadFloat(iniPath, "JetpackResponse", "RecoilScale", jetpackRecoilScale), 0.0f, 4.0f);
+        mountedWeaponResponseEnabled = ReadBool(iniPath, "MountedWeapons", "Enabled", mountedWeaponResponseEnabled);
+
+        jetpackDirectionalEnabled = ReadBool(iniPath, "JetpackResponse", "Enabled", jetpackDirectionalEnabled);
+
+        boatWaveStrength = ReadFloat(iniPath, "AdvancedResponse", "BoatWaveStrength", boatWaveStrength);
+
+        boatWavePhysicalEnabled = ReadBool(iniPath, "BoatResponse", "Enabled", boatWavePhysicalEnabled);
+        boatWaveHeaveScale = ReadFloat(iniPath, "BoatResponse", "HeaveScale", boatWaveHeaveScale);
+        boatWaveSlamStrength = ReadFloat(iniPath, "BoatResponse", "SlamStrength", boatWaveSlamStrength);
+
+
+        aircraftPhysicalEnabled = ReadBool(iniPath, "AircraftResponse", "Enabled", aircraftPhysicalEnabled);
+        aircraftWeatherInfluence = ReadFloat(iniPath, "AircraftResponse", "WeatherInfluence", aircraftWeatherInfluence);
+
+
+
+
+
+        rotationEnabled = ReadBool(iniPath, "Rotation", "Enabled", rotationEnabled);
+
+        fovEnabled = ReadBool(iniPath, "FOV", "Enabled", fovEnabled);
+        fovWalk = ReadFloat(iniPath, "FOV", "Walk", fovWalk);
+        fovRun = ReadFloat(iniPath, "FOV", "Run", fovRun);
+        fovSprint = ReadFloat(iniPath, "FOV", "Sprint", fovSprint);
+        fovCrouch = ReadFloat(iniPath, "FOV", "Crouch", fovCrouch);
+        fovAim = ReadFloat(iniPath, "FOV", "Aim", fovAim);
+        fovVehicleSpeed = ReadFloat(iniPath, "FOV", "VehicleSpeed", fovVehicleSpeed);
+        fovRecoilKick = ReadFloat(iniPath, "FOV", "RecoilKick", fovRecoilKick);
+        fovMeleeKick = ReadFloat(iniPath, "FOV", "MeleeKick", fovMeleeKick);
+        fovDamageKick = ReadFloat(iniPath, "FOV", "DamageKick", fovDamageKick);
+        fovExplosionKick = ReadFloat(iniPath, "FOV", "ExplosionKick", fovExplosionKick);
+        fovLandingKick = ReadFloat(iniPath, "FOV", "LandingKick", fovLandingKick);
+        fovVehicleImpactKick = ReadFloat(iniPath, "FOV", "VehicleImpactKick", fovVehicleImpactKick);
+
+        incomingMeleeDamageScale = ReadFloat(iniPath, "DamageResponse", "MeleeScale", incomingMeleeDamageScale);
+        incomingBulletDamageScale = ReadFloat(iniPath, "DamageResponse", "BulletScale", incomingBulletDamageScale);
+        incomingExplosiveDamageScale = ReadFloat(iniPath, "DamageResponse", "ExplosiveScale", incomingExplosiveDamageScale);
+
+
+        detailedMeleeWeapons = ReadBool(iniPath, "MeleeWeapons", "Enabled", detailedMeleeWeapons);
+        batSwingScale = ReadFloat(iniPath, "MeleeWeapons", "BatClubScale", batSwingScale);
+        knifeSwingScale = ReadFloat(iniPath, "MeleeWeapons", "KnifeScale", knifeSwingScale);
+        chainsawVibration = ReadFloat(iniPath, "MeleeWeapons", "ChainsawVibration", chainsawVibration);
+        heavyMeleeScale = ReadFloat(iniPath, "MeleeWeapons", "HeavyScale", heavyMeleeScale);
+
+        contextualRecoilEnabled = ReadBool(iniPath, "RecoilContext", "Enabled", contextualRecoilEnabled);
+
+        reloadAnimationResponse = ReadBool(iniPath, "ReloadResponse", "Enabled", reloadAnimationResponse);
+
+
+        runtimeReloadEnabled = ReadBool(iniPath, "Developer", "RuntimeReload", runtimeReloadEnabled);
+        detailedDebugHud = ReadBool(iniPath, "Developer", "DetailedHUD", detailedDebugHud);
+
+        transitionsEnabled = ReadBool(iniPath, "General", "TransitionsEnabled", transitionsEnabled);
+        meleeEnabled = ReadBool(iniPath, "General", "MeleeEnabled", meleeEnabled);
+        breathingEnabled = ReadBool(iniPath, "General", "BreathingEnabled", breathingEnabled);
+        surfaceStepsEnabled = ReadBool(iniPath, "General", "SurfaceStepsEnabled", surfaceStepsEnabled);
+
+        vehicleEnabled = ReadBool(iniPath, "Vehicle", "Enabled", vehicleEnabled);
+        vehicleStrength = ReadFloat(iniPath, "Vehicle", "Strength", vehicleStrength);
+        vehicleAccelForward = ReadFloat(iniPath, "Vehicle", "AccelerationWeight", vehicleAccelForward);
+        vehicleBrakeForward = ReadFloat(iniPath, "Vehicle", "BrakingWeight", vehicleBrakeForward);
+        vehicleCornerSide = ReadFloat(iniPath, "Vehicle", "CorneringWeight", vehicleCornerSide);
+        vehicleSpeedVibration = ReadFloat(iniPath, "Vehicle", "SpeedVibration", vehicleSpeedVibration);
+        vehicleImpactImpulse = ReadFloat(iniPath, "Vehicle", "ImpactImpulse", vehicleImpactImpulse);
+        vehicleContactResponseEnabled = ReadBool(iniPath, "VehicleCrash", "ContactResponse", vehicleContactResponseEnabled);
+        vehicleCrashDamageEnabled = ReadBool(iniPath, "VehicleCrash", "DamageResponse", vehicleCrashDamageEnabled);
+        vehicleCrashDamageStrength = ReadFloat(iniPath, "VehicleCrash", "DamageStrength", vehicleCrashDamageStrength);
+        vehicleSuspensionEnabled = ReadBool(iniPath, "VehicleCrash", "SuspensionResponse", vehicleSuspensionEnabled);
+        vehicleSuspensionHandlingInfluence = Clamp(vehicleSuspensionHandlingInfluence, 0.0f, 1.5f);
+        vehicleAutomobileScale = ReadFloat(iniPath, "VehicleProfiles", "Automobile", vehicleAutomobileScale);
+        vehicleBikeScale = ReadFloat(iniPath, "VehicleProfiles", "Bike", vehicleBikeScale);
+        vehicleBoatScale = ReadFloat(iniPath, "VehicleProfiles", "Boat", vehicleBoatScale);
+        vehicleHeliScale = ReadFloat(iniPath, "VehicleProfiles", "Helicopter", vehicleHeliScale);
+        vehiclePlaneScale = ReadFloat(iniPath, "VehicleProfiles", "Plane", vehiclePlaneScale);
+        vehicleOtherScale = ReadFloat(iniPath, "VehicleProfiles", "Other", vehicleOtherScale);
+
+
+
+        jumpImpulse = ReadFloat(iniPath, "Impact", "JumpImpulse", jumpImpulse);
+        landingImpulse = ReadFloat(iniPath, "Impact", "LandingImpulse", landingImpulse);
+        damageImpulse = ReadFloat(iniPath, "Impact", "DamageImpulse", damageImpulse);
+        explosionImpulse = ReadFloat(iniPath, "Impact", "ExplosionImpulse", explosionImpulse);
+
+        detailedPlayerMelee = ReadBool(iniPath, "Melee", "DetailedPlayerResponse", detailedPlayerMelee);
+
+
+        recoilEnabled = ReadBool(
+            iniPath, "Recoil", "Enabled", recoilEnabled
+        );
+        recoilStrength = ReadFloat(
+            iniPath, "Recoil", "Strength", recoilStrength
+        );
+        recoilPistol = ReadFloat(iniPath, "RecoilProfiles", "Pistol", recoilPistol);
+        recoilDeagle = ReadFloat(iniPath, "RecoilProfiles", "DesertEagle", recoilDeagle);
+        recoilSmg = ReadFloat(iniPath, "RecoilProfiles", "SMG", recoilSmg);
+        recoilRifle = ReadFloat(iniPath, "RecoilProfiles", "Rifle", recoilRifle);
+        recoilShotgun = ReadFloat(iniPath, "RecoilProfiles", "Shotgun", recoilShotgun);
+        recoilSniper = ReadFloat(iniPath, "RecoilProfiles", "Sniper", recoilSniper);
+        recoilLauncher = ReadFloat(iniPath, "RecoilProfiles", "Launcher", recoilLauncher);
+        recoilFlamethrower = ReadFloat(iniPath, "RecoilProfiles", "Flamethrower", recoilFlamethrower);
+        recoilMinigun = ReadFloat(iniPath, "RecoilProfiles", "Minigun", recoilMinigun);
+
+        for (int id = 0; id < 47; ++id) {
+            weaponScale[id] = -1.0f;
+            weaponVertical[id] = 1.0f;
+            weaponForward[id] = 1.0f;
+            weaponSide[id] = 1.0f;
+            weaponRecovery[id] = 1.0f;
+        }
+        // Per-weapon constants stay internal; user gains remain configurable.
+        static constexpr float recoilTuning[17][5] = {
+            {-1.000f, 1.000f, 1.000f, 1.000f, 1.000f}, // Colt45
+            {-1.000f, 1.000f, 1.000f, 1.000f, 1.000f}, // Silenced
+            {-1.000f, 1.100f, 1.100f, 1.050f, 0.950f}, // DesertEagle
+            {-1.000f, 1.180f, 1.220f, 1.080f, 0.880f}, // Shotgun
+            {-1.000f, 1.120f, 1.150f, 1.100f, 0.900f}, // Sawnoff
+            {-1.000f, 1.250f, 1.280f, 1.120f, 0.850f}, // Spas12
+            {-1.000f, 0.920f, 0.900f, 1.050f, 1.150f}, // MicroUzi
+            {-1.000f, 0.900f, 0.880f, 1.050f, 1.150f}, // MP5
+            {-1.000f, 1.000f, 1.000f, 1.000f, 1.050f}, // AK47
+            {-1.000f, 0.960f, 0.960f, 1.020f, 1.080f}, // M4
+            {-1.000f, 0.900f, 0.880f, 1.080f, 1.160f}, // Tec9
+            {-1.000f, 1.080f, 1.080f, 0.900f, 0.920f}, // CountryRifle
+            {-1.000f, 1.120f, 1.100f, 0.880f, 0.900f}, // SniperRifle
+            {-1.000f, 1.200f, 1.250f, 1.120f, 0.820f}, // RocketLauncher
+            {-1.000f, 1.160f, 1.200f, 1.080f, 0.840f}, // HeatSeeker
+            {-1.000f, 0.550f, 0.450f, 0.650f, 1.100f}, // Flamethrower
+            {-1.000f, 0.620f, 0.580f, 1.150f, 1.280f}, // Minigun
+        };
+        for (int id = 22; id <= 38; ++id) {
+            const float* p = recoilTuning[id - 22];
+            weaponScale[id] = p[0];
+            weaponVertical[id] = p[1];
+            weaponForward[id] = p[2];
+            weaponSide[id] = p[3];
+            weaponRecovery[id] = p[4];
+        }
+
+        static const float dScale[16] = {1.00f,1.08f,1.05f,0.82f,0.82f,1.00f,1.22f,0.70f,0.94f,0.78f,0.72f,0.76f,0.72f,0.76f,0.58f,0.68f};
+        static const float dSideW[16] = {1.00f,1.05f,1.40f,1.05f,0.45f,1.32f,1.05f,1.12f,1.30f,0.55f,0.85f,0.88f,0.82f,0.86f,0.72f,0.95f};
+        static const float dVertW[16] = {1.00f,1.05f,0.18f,0.14f,0.08f,0.22f,0.34f,0.12f,0.16f,0.12f,0.13f,0.14f,0.12f,0.13f,0.10f,0.14f};
+        static const float dForward[16] = {1.00f,1.05f,0.27f,0.23f,0.17f,0.31f,0.36f,0.22f,0.29f,0.13f,0.20f,0.21f,0.19f,0.20f,0.16f,0.22f};
+        static const float dSide[16] = {1.00f,1.05f,0.24f,0.15f,0.08f,0.22f,0.20f,0.16f,0.25f,0.07f,0.12f,0.13f,0.11f,0.12f,0.09f,0.15f};
+        static const float dContact[16] = {1.00f,1.10f,1.08f,0.92f,0.90f,1.10f,1.22f,0.88f,1.18f,1.30f,0.80f,0.84f,0.78f,0.82f,0.62f,0.86f};
+        static const float dLock[16] = {1.00f,1.00f,0.96f,1.00f,0.92f,0.96f,0.94f,0.95f,0.94f,1.08f,0.92f,0.92f,0.90f,0.90f,0.88f,0.94f};
+        static const unsigned dCooldown[16] = {170u,175u,250u,180u,170u,235u,275u,200u,205u,115u,190u,190u,185u,185u,175u,205u};
+
+        for (int id = 0; id < 16; ++id) {
+            meleeWeaponScale[id]=dScale[id];
+            meleeWeaponSideWeight[id]=dSideW[id];
+            meleeWeaponVerticalWeight[id]=dVertW[id];
+            meleeWeaponReleaseForward[id]=dForward[id];
+            meleeWeaponReleaseSide[id]=dSide[id];
+            meleeWeaponContactScale[id]=dContact[id];
+            meleeWeaponLockOnScale[id]=dLock[id];
+            meleeWeaponCooldownMs[id]=dCooldown[id];
+        }
+
+
+        spring = ReadFloat(iniPath, "Smoothing", "Spring", spring);
+        damping = ReadFloat(iniPath, "Smoothing", "Damping", damping);
+
+        debug = ReadBool(iniPath, "Debug", "Enabled", debug);
+logSteps = ReadBool(
+            iniPath, "Debug", "LogStepEvents", logSteps
+        );
+        logShots = ReadBool(
+            iniPath, "Debug", "LogShotEvents", logShots
+        );
+        overlayEnabled = ReadBool(iniPath, "Debug", "OverlayEnabled", overlayEnabled);
+        overlayScale = Clamp(ReadFloat(iniPath, "Debug", "OverlayScale", overlayScale), 0.65f, 2.5f);
+        auditEnabled = ReadBool(iniPath, "DebugAudit", "Enabled", auditEnabled);
+
+        strength = Clamp(strength, 0.0f, 4.0f);
+        masterOverallScale = Clamp(masterOverallScale, 0.0f, 3.0f);
+        masterMovementScale = Clamp(masterMovementScale, 0.0f, 3.0f);
+        masterCombatScale = Clamp(masterCombatScale, 0.0f, 3.0f);
+        masterVehicleScale = Clamp(masterVehicleScale, 0.0f, 3.0f);
+        masterWorldScale = Clamp(masterWorldScale, 0.0f, 3.0f);
+        masterFovScale = Clamp(masterFovScale, 0.0f, 3.0f);
+        recoilStrength = Clamp(recoilStrength, 0.0f, 4.0f);
+        recoilVerticalKick = Clamp(recoilVerticalKick, 0.0f, 0.50f);
+        recoilForwardKick = Clamp(recoilForwardKick, 0.0f, 0.30f);
+        recoilSideKick = Clamp(recoilSideKick, 0.0f, 0.20f);
+        recoilPositionVertical = Clamp(recoilPositionVertical, 0.0f, 0.20f);
+        recoilPositionForward = Clamp(recoilPositionForward, 0.0f, 0.10f);
+        recoilPositionSide = Clamp(recoilPositionSide, 0.0f, 0.05f);
+        recoilVelocityVertical = Clamp(recoilVelocityVertical, 0.0f, 4.0f);
+        recoilVelocityForward = Clamp(recoilVelocityForward, 0.0f, 2.0f);
+        recoilVelocitySide = Clamp(recoilVelocitySide, 0.0f, 1.0f);
+        fallbackGait = Clamp(fallbackGait, 0.0f, 1.0f);
+        crouchScale = Clamp(crouchScale, 0.0f, 2.0f);
+        airborneScale = Clamp(airborneScale, 0.0f, 1.0f);
+        movementDeadzone = Clamp(movementDeadzone, 0.0f, 0.05f);
+        idleSettleDelay = Clamp(idleSettleDelay, 0.0f, 3.0f);
+        idleSettledScale = Clamp(idleSettledScale, 0.0f, 1.0f);
+        directionalInertia = Clamp(directionalInertia, 0.0f, 3.0f);
+        strafeSway = Clamp(strafeSway, 0.0f, 0.20f);
+        backwardSway = Clamp(backwardSway, 0.0f, 0.15f);
+        jumpImpulse = Clamp(jumpImpulse, 0.0f, 2.0f);
+        landingImpulse = Clamp(landingImpulse, 0.0f, 2.5f);
+        hardLandingScale = Clamp(hardLandingScale, 0.5f, 3.0f);
+        damageImpulse = Clamp(damageImpulse, 0.0f, 2.0f);
+        damageSideImpulse = Clamp(damageSideImpulse, 0.0f, 1.0f);
+        explosionImpulse = Clamp(explosionImpulse, 0.0f, 3.0f);
+        explosionRadius = Clamp(explosionRadius, 3.0f, 80.0f);
+        maxImpactOffset = Clamp(maxImpactOffset, 0.10f, 0.80f);
+        maxFinalSide = Clamp(maxFinalSide, 0.05f, 1.50f);
+        maxFinalVertical = Clamp(maxFinalVertical, 0.05f, 2.00f);
+        maxFinalForward = Clamp(maxFinalForward, 0.05f, 1.00f);
+        meleeImpact = Clamp(meleeImpact, 0.0f, 2.0f);
+        meleeSide = Clamp(meleeSide, 0.0f, 1.0f);
+        punchWindup = Clamp(punchWindup, 0.0f, 1.0f);
+        punchRelease = Clamp(punchRelease, 0.0f, 2.0f);
+        punchContact = Clamp(punchContact, 0.0f, 2.0f);
+        punchSide = Clamp(punchSide, 0.0f, 1.0f);
+        punchVertical = Clamp(punchVertical, 0.0f, 1.0f);
+        punchReleasePhase = Clamp(punchReleasePhase, 0.05f, 0.90f);
+        kickWindup = Clamp(kickWindup, 0.0f, 1.5f);
+        kickRelease = Clamp(kickRelease, 0.0f, 2.5f);
+        kickContact = Clamp(kickContact, 0.0f, 2.5f);
+        kickSide = Clamp(kickSide, 0.0f, 1.0f);
+        kickVertical = Clamp(kickVertical, 0.0f, 1.5f);
+        kickReleasePhase = Clamp(kickReleasePhase, 0.05f, 0.90f);
+        meleeComboStep = Clamp(meleeComboStep, 0.0f, 0.30f);
+        meleeComboMaxScale = Clamp(meleeComboMaxScale, 1.0f, 2.0f);
+        aimBreathingRate = Clamp(aimBreathingRate, 0.1f, 3.0f);
+        firstShotMultiplier = Clamp(firstShotMultiplier, 0.1f, 3.0f);
+        sustainedShotMultiplier = Clamp(sustainedShotMultiplier, 0.1f, 3.0f);
+        for (int id = 22; id <= 38; ++id) {
+            weaponScale[id] = Clamp(weaponScale[id], -1.0f, 4.0f);
+            weaponVertical[id] = Clamp(weaponVertical[id], 0.0f, 3.0f);
+            weaponForward[id] = Clamp(weaponForward[id], 0.0f, 3.0f);
+            weaponSide[id] = Clamp(weaponSide[id], 0.0f, 3.0f);
+            weaponRecovery[id] = Clamp(weaponRecovery[id], 0.4f, 3.0f);
+        }
+        spring = Clamp(spring, 1.0f, 160.0f);
+        damping = Clamp(damping, 0.1f, 60.0f);
+        lookSpring = Clamp(lookSpring, 1.0f, 180.0f);
+        lookDamping = Clamp(lookDamping, 0.1f, 70.0f);
+        stateResponse = Clamp(stateResponse, 0.1f, 40.0f);
+        footPhaseResponse = Clamp(footPhaseResponse, 2.0f, 30.0f);
+        recoilSpringMultiplier = Clamp(recoilSpringMultiplier, 0.50f, 4.0f);
+        recoilDampingMultiplier = Clamp(recoilDampingMultiplier, 0.50f, 4.0f);
+        idleDampingMultiplier = Clamp(idleDampingMultiplier, 1.0f, 4.0f);
+        idlePitchDeg = Clamp(idlePitchDeg, 0.0f, 3.0f);
+        idleRollDeg = Clamp(idleRollDeg, 0.0f, 3.0f);
+        gaitPitchDeg = Clamp(gaitPitchDeg, 0.0f, 5.0f);
+        gaitRollDeg = Clamp(gaitRollDeg, 0.0f, 5.0f);
+        turnRollDeg = Clamp(turnRollDeg, 0.0f, 4.0f);
+        lookYawDeg = Clamp(lookYawDeg, 0.0f, 3.0f);
+        lookPitchDeg = Clamp(lookPitchDeg, 0.0f, 3.0f);
+        maxPitchDeg = Clamp(maxPitchDeg, 0.0f, 6.0f);
+        maxRollDeg = Clamp(maxRollDeg, 0.0f, 6.0f);
+        maxYawDeg = Clamp(maxYawDeg, 0.0f, 4.0f);
+        rotationSafetyScale = Clamp(rotationSafetyScale, 0.0f, 1.0f);
+        explosionPitchDeg = Clamp(explosionPitchDeg, 0.0f, 8.0f);
+        explosionRollDeg = Clamp(explosionRollDeg, 0.0f, 10.0f);
+        explosionYawDeg = Clamp(explosionYawDeg, 0.0f, 4.0f);
+        explosionRotationSpring = Clamp(explosionRotationSpring, 5.0f, 120.0f);
+        explosionRotationDamping = Clamp(explosionRotationDamping, 1.0f, 40.0f);
+        fovMinMultiplier = Clamp(fovMinMultiplier, 0.70f, 1.0f);
+        fovMaxMultiplier = Clamp(fovMaxMultiplier, 1.0f, 1.35f);
+        if (fovMinMultiplier > fovMaxMultiplier) std::swap(fovMinMultiplier, fovMaxMultiplier);
+        fovResponse = Clamp(fovResponse, 0.5f, 30.0f);
+        fovReturnResponse = Clamp(fovReturnResponse, 0.5f, 30.0f);
+        fovKickDecay = Clamp(fovKickDecay, 0.5f, 30.0f);
+        fovWalk = Clamp(fovWalk, -0.10f, 0.10f);
+        fovRun = Clamp(fovRun, -0.10f, 0.12f);
+        fovSprint = Clamp(fovSprint, -0.10f, 0.15f);
+        fovCrouch = Clamp(fovCrouch, -0.10f, 0.10f);
+        fovAim = Clamp(fovAim, -0.15f, 0.10f);
+        fovAirborne = Clamp(fovAirborne, -0.10f, 0.12f);
+        fovVehicleSpeed = Clamp(fovVehicleSpeed, -0.10f, 0.20f);
+        fovVehicleAccel = Clamp(fovVehicleAccel, -0.10f, 0.12f);
+        fovVehicleBrake = Clamp(fovVehicleBrake, -0.12f, 0.10f);
+        fovVehicleCorner = Clamp(fovVehicleCorner, -0.10f, 0.12f);
+        fovRecoilKick = Clamp(fovRecoilKick, -0.08f, 0.08f);
+        fovMeleeKick = Clamp(fovMeleeKick, -0.08f, 0.08f);
+        fovDamageKick = Clamp(fovDamageKick, -0.12f, 0.08f);
+        fovExplosionKick = Clamp(fovExplosionKick, -0.15f, 0.10f);
+        fovLandingKick = Clamp(fovLandingKick, -0.12f, 0.08f);
+        fovVehicleImpactKick = Clamp(fovVehicleImpactKick, -0.15f, 0.10f);
+        fovChainsawAttack = Clamp(fovChainsawAttack, -0.05f, 0.08f);
+        fovChainsawSaw = Clamp(fovChainsawSaw, -0.05f, 0.10f);
+        fovContinuousTool = Clamp(fovContinuousTool, -0.05f, 0.08f);
+        lowFrequencyScale = Clamp(lowFrequencyScale, 0.0f, 2.0f);
+        midFrequencyScale = Clamp(midFrequencyScale, 0.0f, 2.0f);
+        highFrequencyBandScale = Clamp(highFrequencyBandScale, 0.0f, 2.0f);
+        proceduralNoiseMix = Clamp(proceduralNoiseMix, 0.0f, 1.0f);
+        directionalDamageWeight = Clamp(directionalDamageWeight, 0.0f, 2.0f);
+        incomingMeleeDamageScale = Clamp(incomingMeleeDamageScale, 0.0f, 3.0f);
+        incomingBulletDamageScale = Clamp(incomingBulletDamageScale, 0.0f, 3.0f);
+        incomingBulletMidPunch = Clamp(incomingBulletMidPunch, 0.0f, 0.30f);
+        incomingBulletSnap = Clamp(incomingBulletSnap, 0.0f, 0.30f);
+        incomingBulletRecovery = Clamp(incomingBulletRecovery, 0.10f, 2.0f);
+        incomingExplosiveDamageScale = Clamp(incomingExplosiveDamageScale, 0.0f, 4.0f);
+        incomingOtherDamageScale = Clamp(incomingOtherDamageScale, 0.0f, 3.0f);
+        incomingDamageMinSeverity = Clamp(incomingDamageMinSeverity, 0.0f, 1.0f);
+        incomingDamageHighSnap = Clamp(incomingDamageHighSnap, 0.0f, 0.30f);
+        npcBulletHitRadius = Clamp(npcBulletHitRadius, 0.08f, 1.0f);
+        npcBulletHitFallbackScale = Clamp(npcBulletHitFallbackScale, 0.0f, 3.0f);
+        npcBulletHitFallbackCooldownMs =
+            static_cast<unsigned>(
+                Clamp<int>(
+                    static_cast<int>(npcBulletHitFallbackCooldownMs),
+                    40,
+                    1000
+                )
+            );
+        explosionOccludedScale = Clamp(explosionOccludedScale, 0.05f, 1.0f);
+        cameraOffsetCollisionPadding = Clamp(cameraOffsetCollisionPadding, 0.0f, 0.20f);
+        batSwingScale = Clamp(batSwingScale, 0.0f, 2.5f);
+        knifeSwingScale = Clamp(knifeSwingScale, 0.0f, 2.5f);
+        chainsawVibration = Clamp(chainsawVibration, 0.0f, 0.12f);
+        chainsawIdleVibration = Clamp(chainsawIdleVibration, 0.0f, 0.06f);
+        chainsawAttackVibration = Clamp(chainsawAttackVibration, 0.0f, 0.10f);
+        chainsawSawVibration = Clamp(chainsawSawVibration, 0.0f, 0.16f);
+        chainsawIdleHz = Clamp(chainsawIdleHz, 2.0f, 30.0f);
+        chainsawAttackHz = Clamp(chainsawAttackHz, 5.0f, 45.0f);
+        chainsawSawHz = Clamp(chainsawSawHz, 8.0f, 60.0f);
+        chainsawForwardLoad = Clamp(chainsawForwardLoad, 0.0f, 0.12f);
+        chainsawContactHoldMs = Clamp(chainsawContactHoldMs, 40.0f, 500.0f);
+        continuousToolVibration = Clamp(continuousToolVibration, 0.0f, 0.08f);
+        heavyMeleeScale = Clamp(heavyMeleeScale, 0.0f, 3.0f);
+        recoilCrouchScale = Clamp(recoilCrouchScale, 0.2f, 2.0f);
+        recoilAimScale = Clamp(recoilAimScale, 0.2f, 2.0f);
+        recoilMovingScale = Clamp(recoilMovingScale, 0.2f, 2.5f);
+        recoilDualWieldScale = Clamp(recoilDualWieldScale, 0.2f, 2.5f);
+        reloadInsertScale = Clamp(reloadInsertScale, 0.0f, 2.0f);
+        reloadActionScale = Clamp(reloadActionScale, 0.0f, 2.0f);
+        wheelCompressionStrength = Clamp(wheelCompressionStrength, 0.0f, 2.0f);
+        tractionLossStrength = Clamp(tractionLossStrength, 0.0f, 0.30f);
+        tractionRegainStrength = Clamp(tractionRegainStrength, 0.0f, 1.0f);
+
+        for (int id=0; id<16; ++id) {
+            meleeWeaponScale[id]=Clamp(meleeWeaponScale[id],0.0f,3.0f);
+            meleeWeaponSideWeight[id]=Clamp(meleeWeaponSideWeight[id],0.0f,3.0f);
+            meleeWeaponVerticalWeight[id]=Clamp(meleeWeaponVerticalWeight[id],0.0f,3.0f);
+            meleeWeaponReleaseForward[id]=Clamp(meleeWeaponReleaseForward[id],0.0f,1.0f);
+            meleeWeaponReleaseSide[id]=Clamp(meleeWeaponReleaseSide[id],0.0f,1.0f);
+            meleeWeaponContactScale[id]=Clamp(meleeWeaponContactScale[id],0.0f,3.0f);
+            meleeWeaponLockOnScale[id]=Clamp(meleeWeaponLockOnScale[id],0.2f,2.0f);
+        }
+        contextIndoorScale=Clamp(contextIndoorScale,0.0f,1.5f);
+        contextAimScale=Clamp(contextAimScale,0.0f,1.5f);
+        contextCrouchScale=Clamp(contextCrouchScale,0.0f,1.5f);
+        contextLowHealthScale=Clamp(contextLowHealthScale,0.0f,1.5f);
+        contextLowHealthThreshold=Clamp(contextLowHealthThreshold,1.0f,100.0f);
+        contextScriptedScale=Clamp(contextScriptedScale,0.0f,1.0f);
+        contextIndoorCeilingHeight=Clamp(contextIndoorCeilingHeight,2.0f,30.0f);
+        landingSurfaceInfluence=Clamp(landingSurfaceInfluence,0.0f,1.5f);
+        landingSoftMinScale=Clamp(landingSoftMinScale,0.3f,1.0f);
+        landingHardMaxScale=Clamp(landingHardMaxScale,1.0f,2.0f);
+        engineRpmVibration=Clamp(engineRpmVibration,0.0f,0.08f);
+        engineRpmMinHz=Clamp(engineRpmMinHz,1.0f,30.0f);
+        engineRpmMaxHz=Clamp(engineRpmMaxHz,engineRpmMinHz,45.0f);
+        engineLoadInfluence=Clamp(engineLoadInfluence,0.0f,2.0f);
+        bikeEngineScale=Clamp(bikeEngineScale,0.2f,3.0f);
+        gearShiftCarScale=Clamp(gearShiftCarScale,0.2f,3.0f);
+        gearShiftBikeScale=Clamp(gearShiftBikeScale,0.2f,3.0f);
+        gearShiftPulseRecovery=Clamp(gearShiftPulseRecovery,0.1f,2.0f);
+
+        jetpackDirectionalStrength = Clamp(jetpackDirectionalStrength, 0.0f, 0.40f);
+        jetpackForwardScale = Clamp(jetpackForwardScale, 0.0f, 2.5f);
+        jetpackBackwardScale = Clamp(jetpackBackwardScale, 0.0f, 2.5f);
+        jetpackSideScale = Clamp(jetpackSideScale, 0.0f, 2.5f);
+        jetpackVerticalScale = Clamp(jetpackVerticalScale, 0.0f, 2.5f);
+        jetpackAccelInfluence = Clamp(jetpackAccelInfluence, 0.0f, 3.0f);
+        jetpackVelocityInfluence = Clamp(jetpackVelocityInfluence, 0.0f, 2.0f);
+        jetpackHoverVibration = Clamp(jetpackHoverVibration, 0.0f, 0.030f);
+        jetpackHoverHz = Clamp(jetpackHoverHz, 1.0f, 24.0f);
+        jetpackSmoothing = Clamp(jetpackSmoothing, 1.0f, 30.0f);
+        jetpackMaxSide = Clamp(jetpackMaxSide, 0.0f, 0.20f);
+        jetpackMaxVertical = Clamp(jetpackMaxVertical, 0.0f, 0.20f);
+        jetpackMaxForward = Clamp(jetpackMaxForward, 0.0f, 0.20f);
+
+        boatWaveHeaveScale = Clamp(boatWaveHeaveScale, 0.0f, 0.25f);
+        boatWavePitchScale = Clamp(boatWavePitchScale, 0.0f, 0.25f);
+        boatWaveRollScale = Clamp(boatWaveRollScale, 0.0f, 0.25f);
+        boatWaveOrientationHold = Clamp(boatWaveOrientationHold, 0.0f, 0.10f);
+        boatWaveSpeedInfluence = Clamp(boatWaveSpeedInfluence, 0.0f, 2.0f);
+        boatWaveSmoothing = Clamp(boatWaveSmoothing, 1.0f, 30.0f);
+        boatWaveSlamThreshold = Clamp(boatWaveSlamThreshold, 0.25f, 12.0f);
+        boatWaveSlamStrength = Clamp(boatWaveSlamStrength, 0.0f, 0.40f);
+        boatWaveRotationPitchDeg = Clamp(boatWaveRotationPitchDeg, 0.0f, 4.0f);
+        boatWaveRotationRollDeg = Clamp(boatWaveRotationRollDeg, 0.0f, 5.0f);
+        boatWaveMaxSide = Clamp(boatWaveMaxSide, 0.0f, 0.20f);
+        boatWaveMaxVertical = Clamp(boatWaveMaxVertical, 0.0f, 0.25f);
+        boatWaveMaxForward = Clamp(boatWaveMaxForward, 0.0f, 0.20f);
+
+        weatherSmoothing = Clamp(weatherSmoothing, 0.5f, 12.0f);
+        windGustStrength = Clamp(windGustStrength, 0.0f, 1.5f);
+        windGustRate = Clamp(windGustRate, 0.1f, 4.0f);
+        rainTextureRate = Clamp(rainTextureRate, 2.0f, 30.0f);
+        rainVerticalBias = Clamp(rainVerticalBias, 0.0f, 2.0f);
+        sandstormLowFrequency = Clamp(sandstormLowFrequency, 0.1f, 4.0f);
+        earthquakeMaxOffset = Clamp(earthquakeMaxOffset, 0.0f, 0.20f);
+        weatherMaxAmbient = Clamp(weatherMaxAmbient, 0.0f, 0.20f);
+
+        aircraftAccelSideScale = Clamp(aircraftAccelSideScale, 0.0f, 0.10f);
+        aircraftAccelForwardScale = Clamp(aircraftAccelForwardScale, 0.0f, 0.10f);
+        aircraftAccelVerticalScale = Clamp(aircraftAccelVerticalScale, 0.0f, 0.10f);
+        aircraftAttitudeHold = Clamp(aircraftAttitudeHold, 0.0f, 0.15f);
+        aircraftSmoothing = Clamp(aircraftSmoothing, 1.0f, 30.0f);
+        aircraftWeatherInfluence = Clamp(aircraftWeatherInfluence, 0.0f, 2.0f);
+        aircraftPlaneTurbulenceScale = Clamp(aircraftPlaneTurbulenceScale, 0.0f, 3.0f);
+        aircraftHeliTurbulenceScale = Clamp(aircraftHeliTurbulenceScale, 0.0f, 3.0f);
+        aircraftHeliRotorVibration = Clamp(aircraftHeliRotorVibration, 0.0f, 0.03f);
+        aircraftPlaneAirframeVibration = Clamp(aircraftPlaneAirframeVibration, 0.0f, 0.03f);
+        aircraftRotationPitchDeg = Clamp(aircraftRotationPitchDeg, 0.0f, 5.0f);
+        aircraftRotationRollDeg = Clamp(aircraftRotationRollDeg, 0.0f, 6.0f);
+        aircraftTouchdownThreshold = Clamp(aircraftTouchdownThreshold, 0.005f, 0.20f);
+        aircraftTouchdownForwardScale = Clamp(aircraftTouchdownForwardScale, 0.0f, 1.0f);
+        aircraftMaxSide = Clamp(aircraftMaxSide, 0.0f, 0.20f);
+        aircraftMaxVertical = Clamp(aircraftMaxVertical, 0.0f, 0.20f);
+        aircraftMaxForward = Clamp(aircraftMaxForward, 0.0f, 0.20f);
+
+        directionalSourceSide = Clamp(directionalSourceSide, 0.0f, 2.0f);
+        directionalSourceForward = Clamp(directionalSourceForward, 0.0f, 2.0f);
+        directionalSourceVertical = Clamp(directionalSourceVertical, 0.0f, 1.0f);
+        directionalDoorScale = Clamp(directionalDoorScale, 0.0f, 2.0f);
+        directionalWaterScale = Clamp(directionalWaterScale, 0.0f, 2.0f);
+        directionalVehicleTransitionScale = Clamp(directionalVehicleTransitionScale, 0.0f, 2.0f);
+        directionalSwimScale = Clamp(directionalSwimScale, 0.0f, 2.0f);
+        directionalParachuteScale = Clamp(directionalParachuteScale, 0.0f, 2.0f);
+        directionalLargeVehicleScale = Clamp(directionalLargeVehicleScale, 0.0f, 2.0f);
+
+        responseBudgetNormalized = Clamp(responseBudgetNormalized, 0.55f, 2.0f);
+        responseBudgetCriticalReserve = Clamp(responseBudgetCriticalReserve, 0.0f, 0.75f);
+        responseBudgetSoftness = Clamp(responseBudgetSoftness, 0.05f, 1.0f);
+        ambientDuckAttack = Clamp(ambientDuckAttack, 1.0f, 60.0f);
+        ambientDuckRelease = Clamp(ambientDuckRelease, 0.5f, 30.0f);
+        ambientDuckMinimum = Clamp(ambientDuckMinimum, 0.0f, 1.0f);
+        directionalRotationRollDeg = Clamp(directionalRotationRollDeg, 0.0f, 4.0f);
+        directionalRotationPitchDeg = Clamp(directionalRotationPitchDeg, 0.0f, 4.0f);
+        directionalRotationYawDeg = Clamp(directionalRotationYawDeg, 0.0f, 2.0f);
+        directionalRotationSpring = Clamp(directionalRotationSpring, 5.0f, 120.0f);
+        directionalRotationDamping = Clamp(directionalRotationDamping, 1.0f, 40.0f);
+        playerJerkStrength = Clamp(playerJerkStrength, 0.0f, 0.05f);
+        vehicleJerkStrength = Clamp(vehicleJerkStrength, 0.0f, 0.08f);
+        jerkDeadzone = Clamp(jerkDeadzone, 0.0f, 30.0f);
+        jerkMax = Clamp(jerkMax, 1.0f, 80.0f);
+        nearbyApproachInfluence = Clamp(nearbyApproachInfluence, 0.0f, 2.0f);
+        nearbyPassInfluence = Clamp(nearbyPassInfluence, 0.0f, 2.0f);
+        rotorWashDistance = Clamp(rotorWashDistance, 2.0f, 80.0f);
+        rotorWashHeight = Clamp(rotorWashHeight, 2.0f, 60.0f);
+        rotorWashStrength = Clamp(rotorWashStrength, 0.0f, 0.20f);
+        explosionPressureIndoorScale = Clamp(explosionPressureIndoorScale, 0.0f, 1.5f);
+        explosionPressureBelowBoost = Clamp(explosionPressureBelowBoost, 0.0f, 2.0f);
+        explosionPressureAboveScale = Clamp(explosionPressureAboveScale, 0.0f, 1.5f);
+        explosionPressureLateralRoll = Clamp(explosionPressureLateralRoll, 0.0f, 2.0f);
+        footstepSurfaceBandStrength = Clamp(footstepSurfaceBandStrength, 0.0f, 0.10f);
+
+        vehicleStrength = Clamp(vehicleStrength, 0.0f, 3.0f);
+        vehicleAccelForward = Clamp(vehicleAccelForward, 0.0f, 3.0f);
+        vehicleBrakeForward = Clamp(vehicleBrakeForward, 0.0f, 3.0f);
+        vehicleCornerSide = Clamp(vehicleCornerSide, 0.0f, 3.0f);
+        vehicleVerticalAccel = Clamp(vehicleVerticalAccel, 0.0f, 3.0f);
+        vehicleSpeedVibration = Clamp(vehicleSpeedVibration, 0.0f, 0.15f);
+        vehicleSpeedVibrationRate = Clamp(vehicleSpeedVibrationRate, 0.1f, 20.0f);
+        vehicleHornVibration = Clamp(vehicleHornVibration, 0.0f, 0.08f);
+        vehicleHornVibrationRate = Clamp(vehicleHornVibrationRate, 1.0f, 30.0f);
+        vehicleHornAttack = Clamp(vehicleHornAttack, 1.0f, 60.0f);
+        vehicleHornRelease = Clamp(vehicleHornRelease, 1.0f, 60.0f);
+        vehicleImpactThreshold = Clamp(vehicleImpactThreshold, 1.0f, 40.0f);
+        vehicleImpactImpulse = Clamp(vehicleImpactImpulse, 0.0f, 3.0f);
+        vehicleSpring = Clamp(vehicleSpring, 1.0f, 120.0f);
+        vehicleDamping = Clamp(vehicleDamping, 0.1f, 50.0f);
+        vehicleMaxSide = Clamp(vehicleMaxSide, 0.02f, 1.0f);
+        vehicleMaxVertical = Clamp(vehicleMaxVertical, 0.02f, 1.0f);
+        vehicleMaxForward = Clamp(vehicleMaxForward, 0.02f, 1.0f);
+        vehicleAutomobileScale = Clamp(vehicleAutomobileScale, 0.0f, 3.0f);
+        vehicleBikeScale = Clamp(vehicleBikeScale, 0.0f, 3.0f);
+        vehicleBoatScale = Clamp(vehicleBoatScale, 0.0f, 3.0f);
+        vehicleHeliScale = Clamp(vehicleHeliScale, 0.0f, 3.0f);
+        vehiclePlaneScale = Clamp(vehiclePlaneScale, 0.0f, 3.0f);
+        vehicleOtherScale = Clamp(vehicleOtherScale, 0.0f, 3.0f);
+
+        if (comfortPreset) {
+            idleScale=0.0f;
+            aimBreathingSide=aimBreathingVertical=aimBreathingForward=0.0f;
+            nearbyVehiclesStrength=0.0f;
+            windResponseStrength=rainResponseStrength=sandstormResponseStrength=0.0f;
+            machineryStrength=0.0f;
+            nativeShakeBlend=0.0f;
+            trainResponseStrength=aircraftResponseStrength=0.0f;
+            engineVibrationStrength=roadTextureStrength=0.0f;
+            vehicleSpeedVibration=vehicleHornVibration=0.0f;
+            boatWaveStrength=aircraftTurbulenceStrength=0.0f;
+            parachuteAirStrength=jetpackStrength=0.0f;
+            continuousToolVibration=0.0f;
+        }
+    }
+
+    void DumpEffectiveValues(Logger& log) const {
+        if (!auditEnabled || !auditConfigValues)
+            return;
+        log.Write("CONFIG AUDIT BEGIN effective-values");
+        log.Write("CONFIG EFFECTIVE [General] Enabled=%d", enabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [General] Strength=%.6f", strength);
+        log.Write("CONFIG EFFECTIVE [Movement] Idle=%.6f", idleScale);
+        log.Write("CONFIG EFFECTIVE [Movement] Walk=%.6f", walkScale);
+        log.Write("CONFIG EFFECTIVE [Movement] Run=%.6f", runScale);
+        log.Write("CONFIG EFFECTIVE [Movement] Sprint=%.6f", sprintScale);
+        log.Write("CONFIG EFFECTIVE [Movement] Aim=%.6f", aimScale);
+        log.Write("CONFIG EFFECTIVE [Movement] Crouch=%.6f", crouchScale);
+        log.Write("CONFIG EFFECTIVE [Movement] Airborne=%.6f", airborneScale);
+        log.Write("CONFIG EFFECTIVE [Movement] Deadzone=%.6f", movementDeadzone);
+        log.Write("CONFIG EFFECTIVE [General] LocomotionEnabled=%d", locomotionEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [General] FootstepsEnabled=%d", footstepsEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [General] InertiaEnabled=%d", inertiaEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [General] JumpLandEnabled=%d", jumpLandEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [General] DamageEnabled=%d", damageEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [General] ExplosionsEnabled=%d", explosionsEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [NearbyGunfire] Enabled=%d", nearbyGunfireEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [NearbyGunfire] AffectInVehicle=%d", nearbyGunfireInVehicle ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [NearbyGunfire] Strength=%.6f", nearbyGunfireStrength);
+        log.Write("CONFIG EFFECTIVE [NearbyGunfire] MinDistance=%.6f", nearbyGunfireMinDistance);
+        log.Write("CONFIG EFFECTIVE [NearbyGunfire] MaxDistance=%.6f", nearbyGunfireMaxDistance);
+        log.Write("CONFIG EFFECTIVE [NearbyGunfire] FalloffPower=%.6f", nearbyGunfireFalloffPower);
+        log.Write("CONFIG EFFECTIVE [NearbyGunfire] Side=%.6f", nearbyGunfireSide);
+        log.Write("CONFIG EFFECTIVE [NearbyGunfire] Vertical=%.6f", nearbyGunfireVertical);
+        log.Write("CONFIG EFFECTIVE [NearbyGunfire] Forward=%.6f", nearbyGunfireForward);
+        log.Write("CONFIG EFFECTIVE [NearbyVehicles] Enabled=%d", nearbyVehiclesEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [NearbyVehicles] AffectOnFoot=%d", nearbyVehiclesOnFoot ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [NearbyVehicles] AffectInVehicle=%d", nearbyVehiclesInVehicle ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [NearbyVehicles] Strength=%.6f", nearbyVehiclesStrength);
+        log.Write("CONFIG EFFECTIVE [NearbyVehicles] MinDistance=%.6f", nearbyVehiclesMinDistance);
+        log.Write("CONFIG EFFECTIVE [NearbyVehicles] MaxDistance=%.6f", nearbyVehiclesMaxDistance);
+        log.Write("CONFIG EFFECTIVE [NearbyVehicles] FalloffPower=%.6f", nearbyVehiclesFalloffPower);
+        log.Write("CONFIG EFFECTIVE [NearbyVehicles] IdleScale=%.6f", nearbyVehiclesIdleScale);
+        log.Write("CONFIG EFFECTIVE [NearbyVehicles] LowSpeedScale=%.6f", nearbyVehiclesLowSpeedScale);
+        log.Write("CONFIG EFFECTIVE [NearbyVehicles] HighSpeedScale=%.6f", nearbyVehiclesHighSpeedScale);
+        log.Write("CONFIG EFFECTIVE [NearbyVehicles] AccelerationScale=%.6f", nearbyVehiclesAccelerationScale);
+        log.Write("CONFIG EFFECTIVE [NearbyVehicles] Vertical=%.6f", nearbyVehiclesVertical);
+        log.Write("CONFIG EFFECTIVE [NearbyVehicles] Side=%.6f", nearbyVehiclesSide);
+        log.Write("CONFIG EFFECTIVE [NearbyVehicles] Forward=%.6f", nearbyVehiclesForward);
+        log.Write("CONFIG EFFECTIVE [NearbyVehicles] MaxCombined=%.6f", nearbyVehiclesMaxCombined);
+        log.Write("CONFIG EFFECTIVE [NearbyVehicles] MaxContributors=%lu", static_cast<unsigned long>(nearbyVehiclesMaxContributors));
+        log.Write("CONFIG EFFECTIVE [DoorResponse] Enabled=%d", doorResponseEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [DoorResponse] VehicleDoors=%d", vehicleDoorResponseEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [DoorResponse] BuildingDoors=%d", buildingDoorResponseEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [DoorResponse] AffectInVehicle=%d", doorResponseInVehicle ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [DoorResponse] Strength=%.6f", doorResponseStrength);
+        log.Write("CONFIG EFFECTIVE [DoorResponse] VehicleStrength=%.6f", vehicleDoorStrength);
+        log.Write("CONFIG EFFECTIVE [DoorResponse] BuildingStrength=%.6f", buildingDoorStrength);
+        log.Write("CONFIG EFFECTIVE [DoorResponse] MinDistance=%.6f", doorResponseMinDistance);
+        log.Write("CONFIG EFFECTIVE [DoorResponse] MaxDistance=%.6f", doorResponseMaxDistance);
+        log.Write("CONFIG EFFECTIVE [DoorResponse] FalloffPower=%.6f", doorResponseFalloffPower);
+        log.Write("CONFIG EFFECTIVE [DoorResponse] Side=%.6f", doorResponseSide);
+        log.Write("CONFIG EFFECTIVE [DoorResponse] Vertical=%.6f", doorResponseVertical);
+        log.Write("CONFIG EFFECTIVE [DoorResponse] Forward=%.6f", doorResponseForward);
+        log.Write("CONFIG EFFECTIVE [DoorResponse] OwnVehicleScale=%.6f", doorVehicleOwnScale);
+        log.Write("CONFIG EFFECTIVE [DoorResponse] VehicleCloseThreshold=%.6f", vehicleDoorCloseThreshold);
+        log.Write("CONFIG EFFECTIVE [DoorResponse] VehicleWasOpenThreshold=%.6f", vehicleDoorWasOpenThreshold);
+        log.Write("CONFIG EFFECTIVE [DoorResponse] ScanMs=%lu", static_cast<unsigned long>(doorScanMs));
+        log.Write("CONFIG EFFECTIVE [DoorResponse] BonnetScale=%.6f", doorBonnetScale);
+        log.Write("CONFIG EFFECTIVE [DoorResponse] BootScale=%.6f", doorBootScale);
+        log.Write("CONFIG EFFECTIVE [ExtendedVehicle] Enabled=%d", vehicleMechanicalEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [ExtendedVehicle] EnterStrength=%.6f", vehicleEnterStrength);
+        log.Write("CONFIG EFFECTIVE [ExtendedVehicle] ExitStrength=%.6f", vehicleExitStrength);
+        log.Write("CONFIG EFFECTIVE [ExtendedVehicle] BailOutEnabled=%d", vehicleBailOutEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [ExtendedVehicle] BailOutMinSpeed=%.6f", vehicleBailOutMinSpeed);
+        log.Write("CONFIG EFFECTIVE [ExtendedVehicle] BailOutStrength=%.6f", vehicleBailOutStrength);
+        log.Write("CONFIG EFFECTIVE [ExtendedVehicle] BailAirborneWindowMs=%lu", static_cast<unsigned long>(vehicleBailAirborneWindowMs));
+        log.Write("CONFIG EFFECTIVE [ExtendedVehicle] BailLandingScale=%.6f", vehicleBailLandingScale);
+        log.Write("CONFIG EFFECTIVE [ExtendedVehicle] BailFOVKick=%.6f", vehicleBailFovKick);
+        log.Write("CONFIG EFFECTIVE [ExtendedVehicle] EngineStartStrength=%.6f", engineStartStrength);
+        log.Write("CONFIG EFFECTIVE [ExtendedVehicle] EngineStopStrength=%.6f", engineStopStrength);
+        log.Write("CONFIG EFFECTIVE [ExtendedVehicle] GearShiftStrength=%.6f", gearShiftStrength);
+        log.Write("CONFIG EFFECTIVE [ExtendedVehicle] TyreBlowoutStrength=%.6f", tyreBlowoutStrength);
+        log.Write("CONFIG EFFECTIVE [ExtendedVehicle] AxleLandingStrength=%.6f", axleLandingStrength);
+        log.Write("CONFIG EFFECTIVE [WorldResponse] WaterResponse=%d", waterResponseEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [WorldResponse] WaterEntryStrength=%.6f", waterEntryStrength);
+        log.Write("CONFIG EFFECTIVE [WorldResponse] LargeVehicles=%d", largeVehicleResponseEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [WorldResponse] TrainStrength=%.6f", trainResponseStrength);
+        log.Write("CONFIG EFFECTIVE [WorldResponse] TrainDistance=%.6f", trainResponseDistance);
+        log.Write("CONFIG EFFECTIVE [WorldResponse] AircraftStrength=%.6f", aircraftResponseStrength);
+        log.Write("CONFIG EFFECTIVE [WorldResponse] AircraftDistance=%.6f", aircraftResponseDistance);
+        log.Write("CONFIG EFFECTIVE [WorldResponse] LargeVehicleScanMs=%lu", static_cast<unsigned long>(largeVehicleScanMs));
+        log.Write("CONFIG EFFECTIVE [WorldResponse] ObjectImpacts=%d", worldObjectResponseEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [WorldResponse] ObjectImpactStrength=%.6f", worldObjectImpactStrength);
+        log.Write("CONFIG EFFECTIVE [WorldResponse] ObjectImpactDistance=%.6f", worldObjectImpactDistance);
+        log.Write("CONFIG EFFECTIVE [WorldResponse] ObjectScanMs=%lu", static_cast<unsigned long>(worldObjectScanMs));
+        log.Write("CONFIG EFFECTIVE [WorldResponse] PedImpacts=%d", pedWorldResponseEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [WorldResponse] PedImpactStrength=%.6f", pedImpactStrength);
+        log.Write("CONFIG EFFECTIVE [WorldResponse] HeavyFootstepStrength=%.6f", heavyFootstepStrength);
+        log.Write("CONFIG EFFECTIVE [WorldResponse] HeavyFootstepDistance=%.6f", heavyFootstepDistance);
+        log.Write("CONFIG EFFECTIVE [WorldResponse] PedScanMs=%lu", static_cast<unsigned long>(pedWorldScanMs));
+        log.Write("CONFIG EFFECTIVE [EnvironmentResponse] Enabled=%d", weatherResponseEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [EnvironmentResponse] WindStrength=%.6f", windResponseStrength);
+        log.Write("CONFIG EFFECTIVE [EnvironmentResponse] RainStrength=%.6f", rainResponseStrength);
+        log.Write("CONFIG EFFECTIVE [EnvironmentResponse] SandstormStrength=%.6f", sandstormResponseStrength);
+        log.Write("CONFIG EFFECTIVE [EnvironmentResponse] EarthquakeStrength=%.6f", earthquakeResponseStrength);
+        log.Write("CONFIG EFFECTIVE [CameraObstruction] Enabled=%d", obstructionResponseEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [CameraObstruction] Threshold=%.6f", obstructionThreshold);
+        log.Write("CONFIG EFFECTIVE [CameraObstruction] Strength=%.6f", obstructionStrength);
+        log.Write("CONFIG EFFECTIVE [CameraObstruction] Spring=%.6f", obstructionSpring);
+        log.Write("CONFIG EFFECTIVE [CameraObstruction] Damping=%.6f", obstructionDamping);
+        log.Write("CONFIG EFFECTIVE [Performance] EnvironmentPriorityMix=%d", environmentPriorityMixEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [Performance] EnvironmentMixMaxImpulse=%.6f", environmentMixMaxImpulse);
+        log.Write("CONFIG EFFECTIVE [ExtendedVehicle] HandlingPersonality=%d", vehiclePersonalityEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [ExtendedVehicle] CollisionMaterialInfluence=%.6f", collisionMaterialInfluence);
+        log.Write("CONFIG EFFECTIVE [AdvancedResponse] Enabled=%d", advancedResponseEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [AdvancedResponse] ReloadStrength=%.6f", reloadResponseStrength);
+        log.Write("CONFIG EFFECTIVE [AdvancedResponse] EquipStrength=%.6f", equipResponseStrength);
+        log.Write("CONFIG EFFECTIVE [AdvancedResponse] NearMiss=%d", nearMissEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [AdvancedResponse] NearMissStrength=%.6f", nearMissStrength);
+        log.Write("CONFIG EFFECTIVE [AdvancedResponse] NearMissDistance=%.6f", nearMissDistance);
+        log.Write("CONFIG EFFECTIVE [AdvancedResponse] NearMissMaxShooterDistance=%.6f", nearMissMaxShooterDistance);
+        log.Write("CONFIG EFFECTIVE [AdvancedResponse] SwimStrength=%.6f", swimResponseStrength);
+        log.Write("CONFIG EFFECTIVE [AdvancedResponse] ClimbStrength=%.6f", climbResponseStrength);
+        log.Write("CONFIG EFFECTIVE [AdvancedResponse] ParachuteDeployStrength=%.6f", parachuteDeployStrength);
+        log.Write("CONFIG EFFECTIVE [AdvancedResponse] ParachuteAirStrength=%.6f", parachuteAirStrength);
+        log.Write("CONFIG EFFECTIVE [AdvancedResponse] ParachuteLandStrength=%.6f", parachuteLandStrength);
+        log.Write("CONFIG EFFECTIVE [AdvancedResponse] JetpackStrength=%.6f", jetpackStrength);
+        log.Write("CONFIG EFFECTIVE [AdvancedResponse] JetpackTransitionStrength=%.6f", jetpackTransitionStrength);
+        log.Write("CONFIG EFFECTIVE [JetpackResponse] RecoilScale=%.6f", jetpackRecoilScale);
+        log.Write("CONFIG EFFECTIVE [MountedWeapons] Enabled=%d", mountedWeaponResponseEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [MountedWeapons] GunStrength=%.6f", mountedGunStrength);
+        log.Write("CONFIG EFFECTIVE [MountedWeapons] HeavyStrength=%.6f", mountedHeavyStrength);
+        log.Write("CONFIG EFFECTIVE [MountedWeapons] WaterStrength=%.6f", mountedWaterStrength);
+        log.Write("CONFIG EFFECTIVE [AdvancedResponse] BikeLeanStrength=%.6f", bikeLeanStrength);
+        log.Write("CONFIG EFFECTIVE [AdvancedResponse] BikePitchStrength=%.6f", bikePitchStrength);
+        log.Write("CONFIG EFFECTIVE [AdvancedResponse] BicyclePedalStrength=%.6f", bicyclePedalStrength);
+        log.Write("CONFIG EFFECTIVE [AdvancedResponse] BoatWaveStrength=%.6f", boatWaveStrength);
+        log.Write("CONFIG EFFECTIVE [AdvancedResponse] AircraftTurbulenceStrength=%.6f", aircraftTurbulenceStrength);
+        log.Write("CONFIG EFFECTIVE [AdvancedResponse] AircraftLandingStrength=%.6f", aircraftLandingStrength);
+        log.Write("CONFIG EFFECTIVE [AdvancedResponse] TrainJointStrength=%.6f", trainJointStrength);
+        log.Write("CONFIG EFFECTIVE [AdvancedResponse] SkidStrength=%.6f", skidStrength);
+        log.Write("CONFIG EFFECTIVE [AdvancedResponse] EngineVibrationStrength=%.6f", engineVibrationStrength);
+        log.Write("CONFIG EFFECTIVE [AdvancedResponse] RoadTextureStrength=%.6f", roadTextureStrength);
+        log.Write("CONFIG EFFECTIVE [AdvancedResponse] DoorOpenStrength=%.6f", doorOpenStrength);
+        log.Write("CONFIG EFFECTIVE [AdvancedResponse] MachineryStrength=%.6f", machineryStrength);
+        log.Write("CONFIG EFFECTIVE [AdvancedResponse] MachineryDistance=%.6f", machineryDistance);
+        log.Write("CONFIG EFFECTIVE [AdvancedResponse] NativeShakeBlend=%.6f", nativeShakeBlend);
+        log.Write("CONFIG EFFECTIVE [AdvancedResponse] ExplosionShockDelay=%d", explosionShockDelayEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [AdvancedResponse] ExplosionShockSpeed=%.6f", explosionShockSpeed);
+        log.Write("CONFIG EFFECTIVE [AdvancedResponse] ExplosionShockSecondaryScale=%.6f", explosionShockSecondaryScale);
+        log.Write("CONFIG EFFECTIVE [AdvancedResponse] ExplosionOcclusion=%d", explosionOcclusionEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [AdvancedResponse] ExplosionOccludedScale=%.6f", explosionOccludedScale);
+        log.Write("CONFIG EFFECTIVE [AdvancedResponse] ImpactSequencing=%d", impactSequencingEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [AdvancedResponse] ImpactSequenceResetMs=%lu", static_cast<unsigned long>(impactSequenceResetMs));
+        log.Write("CONFIG EFFECTIVE [AdvancedResponse] ImpactSecondaryScale=%.6f", impactSecondaryScale);
+        log.Write("CONFIG EFFECTIVE [AdvancedResponse] ImpactTertiaryScale=%.6f", impactTertiaryScale);
+        log.Write("CONFIG EFFECTIVE [ResponseScales] Locomotion=%.6f", locomotionResponseScale);
+        log.Write("CONFIG EFFECTIVE [ResponseScales] Combat=%.6f", combatResponseScale);
+        log.Write("CONFIG EFFECTIVE [ResponseScales] Vehicle=%.6f", vehicleResponseScale);
+        log.Write("CONFIG EFFECTIVE [ResponseScales] Environment=%.6f", environmentResponseScale);
+        log.Write("CONFIG EFFECTIVE [ResponseScales] HighFrequency=%.6f", highFrequencyScale);
+        log.Write("CONFIG EFFECTIVE [FrequencyBands] Enabled=%d", frequencyBandsEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [FrequencyBands] Low=%.6f", lowFrequencyScale);
+        log.Write("CONFIG EFFECTIVE [FrequencyBands] Mid=%.6f", midFrequencyScale);
+        log.Write("CONFIG EFFECTIVE [FrequencyBands] High=%.6f", highFrequencyBandScale);
+        log.Write("CONFIG EFFECTIVE [ProceduralNoise] Enabled=%d", proceduralNoiseEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [ProceduralNoise] Mix=%.6f", proceduralNoiseMix);
+        log.Write("CONFIG EFFECTIVE [Rotation] Enabled=%d", rotationEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [Rotation] SafetyScale=%.6f", rotationSafetyScale);
+        log.Write("CONFIG EFFECTIVE [DamageResponse] Directional=%d", directionalDamageEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [DamageResponse] DirectionalWeight=%.6f", directionalDamageWeight);
+        log.Write("CONFIG EFFECTIVE [DamageResponse] MeleeScale=%.6f", incomingMeleeDamageScale);
+        log.Write("CONFIG EFFECTIVE [DamageResponse] BulletScale=%.6f", incomingBulletDamageScale);
+        log.Write("CONFIG EFFECTIVE [DamageResponse] BulletMidPunch=%.6f", incomingBulletMidPunch);
+        log.Write("CONFIG EFFECTIVE [DamageResponse] BulletSnap=%.6f", incomingBulletSnap);
+        log.Write("CONFIG EFFECTIVE [DamageResponse] BulletRecovery=%.6f", incomingBulletRecovery);
+        log.Write("CONFIG EFFECTIVE [DamageResponse] ExplosiveScale=%.6f", incomingExplosiveDamageScale);
+        log.Write("CONFIG EFFECTIVE [DamageResponse] OtherScale=%.6f", incomingOtherDamageScale);
+        log.Write("CONFIG EFFECTIVE [DamageResponse] MinSeverity=%.6f", incomingDamageMinSeverity);
+        log.Write("CONFIG EFFECTIVE [DamageResponse] HighSnap=%.6f", incomingDamageHighSnap);
+        log.Write("CONFIG EFFECTIVE [DamageResponse] NpcBulletHitFallback=%d", npcBulletHitFallbackEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [DamageResponse] NpcBulletHitRadius=%.6f", npcBulletHitRadius);
+        log.Write("CONFIG EFFECTIVE [DamageResponse] NpcBulletHitFallbackScale=%.6f", npcBulletHitFallbackScale);
+        log.Write("CONFIG EFFECTIVE [DamageResponse] NpcBulletHitCooldownMs=%lu", static_cast<unsigned long>(npcBulletHitFallbackCooldownMs));
+        log.Write("CONFIG EFFECTIVE [CameraObstruction] OffsetCollision=%d", cameraOffsetCollisionEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [CameraObstruction] OffsetCollisionPadding=%.6f", cameraOffsetCollisionPadding);
+        log.Write("CONFIG EFFECTIVE [MeleeWeapons] Enabled=%d", detailedMeleeWeapons ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [MeleeWeapons] BatClubScale=%.6f", batSwingScale);
+        log.Write("CONFIG EFFECTIVE [MeleeWeapons] KnifeScale=%.6f", knifeSwingScale);
+        log.Write("CONFIG EFFECTIVE [MeleeWeapons] ChainsawVibration=%.6f", chainsawVibration);
+        log.Write("CONFIG EFFECTIVE [MeleeWeapons] HeavyScale=%.6f", heavyMeleeScale);
+        log.Write("CONFIG EFFECTIVE [RecoilContext] Enabled=%d", contextualRecoilEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [RecoilContext] CrouchScale=%.6f", recoilCrouchScale);
+        log.Write("CONFIG EFFECTIVE [RecoilContext] AimScale=%.6f", recoilAimScale);
+        log.Write("CONFIG EFFECTIVE [RecoilContext] MovingScale=%.6f", recoilMovingScale);
+        log.Write("CONFIG EFFECTIVE [RecoilContext] DualWieldScale=%.6f", recoilDualWieldScale);
+        log.Write("CONFIG EFFECTIVE [ReloadResponse] Enabled=%d", reloadAnimationResponse ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [ReloadResponse] InsertScale=%.6f", reloadInsertScale);
+        log.Write("CONFIG EFFECTIVE [ReloadResponse] ActionScale=%.6f", reloadActionScale);
+        log.Write("CONFIG EFFECTIVE [VehicleDynamics] WheelResponse=%d", wheelResponseEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [VehicleDynamics] WheelCompressionStrength=%.6f", wheelCompressionStrength);
+        log.Write("CONFIG EFFECTIVE [VehicleDynamics] TractionLossStrength=%.6f", tractionLossStrength);
+        log.Write("CONFIG EFFECTIVE [VehicleDynamics] TractionRegainStrength=%.6f", tractionRegainStrength);
+        log.Write("CONFIG EFFECTIVE [Developer] RuntimeReload=%d", runtimeReloadEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [Developer] ReloadKey=%ld", static_cast<long>(runtimeReloadKey));
+        log.Write("CONFIG EFFECTIVE [Developer] ReloadDebounceMs=%lu", static_cast<unsigned long>(runtimeReloadDebounceMs));
+        log.Write("CONFIG EFFECTIVE [Developer] DetailedHUD=%d", detailedDebugHud ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [General] TransitionsEnabled=%d", transitionsEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [General] MeleeEnabled=%d", meleeEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [General] BreathingEnabled=%d", breathingEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [General] SurfaceStepsEnabled=%d", surfaceStepsEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [Vehicle] Enabled=%d", vehicleEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [Vehicle] Strength=%.6f", vehicleStrength);
+        log.Write("CONFIG EFFECTIVE [Vehicle] AccelerationWeight=%.6f", vehicleAccelForward);
+        log.Write("CONFIG EFFECTIVE [Vehicle] BrakingWeight=%.6f", vehicleBrakeForward);
+        log.Write("CONFIG EFFECTIVE [Vehicle] CorneringWeight=%.6f", vehicleCornerSide);
+        log.Write("CONFIG EFFECTIVE [Vehicle] VerticalWeight=%.6f", vehicleVerticalAccel);
+        log.Write("CONFIG EFFECTIVE [Vehicle] SpeedVibration=%.6f", vehicleSpeedVibration);
+        log.Write("CONFIG EFFECTIVE [Vehicle] SpeedVibrationRate=%.6f", vehicleSpeedVibrationRate);
+        log.Write("CONFIG EFFECTIVE [VehicleHorn] Enabled=%d", vehicleHornEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [VehicleHorn] Vibration=%.6f", vehicleHornVibration);
+        log.Write("CONFIG EFFECTIVE [VehicleHorn] Rate=%.6f", vehicleHornVibrationRate);
+        log.Write("CONFIG EFFECTIVE [VehicleHorn] Attack=%.6f", vehicleHornAttack);
+        log.Write("CONFIG EFFECTIVE [VehicleHorn] Release=%.6f", vehicleHornRelease);
+        log.Write("CONFIG EFFECTIVE [Vehicle] ImpactThreshold=%.6f", vehicleImpactThreshold);
+        log.Write("CONFIG EFFECTIVE [Vehicle] ImpactImpulse=%.6f", vehicleImpactImpulse);
+        log.Write("CONFIG EFFECTIVE [VehicleCrash] ContactResponse=%d", vehicleContactResponseEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [VehicleCrash] ContactStrength=%.6f", vehicleContactStrength);
+        log.Write("CONFIG EFFECTIVE [VehicleCrash] ContactMinSpeed=%.6f", vehicleContactMinSpeed);
+        log.Write("CONFIG EFFECTIVE [VehicleCrash] ContactDeltaVelocityThreshold=%.6f", vehicleContactDeltaVelocityThreshold);
+        log.Write("CONFIG EFFECTIVE [VehicleCrash] ContactStrongDeltaVelocity=%.6f", vehicleContactStrongDeltaVelocity);
+        log.Write("CONFIG EFFECTIVE [VehicleCrash] ContactDamageReference=%.6f", vehicleContactDamageReference);
+        log.Write("CONFIG EFFECTIVE [VehicleCrash] ContactSpring=%.6f", vehicleContactSpring);
+        log.Write("CONFIG EFFECTIVE [VehicleCrash] ContactDamping=%.6f", vehicleContactDamping);
+        log.Write("CONFIG EFFECTIVE [VehicleCrash] ContactDirectKick=%.6f", vehicleContactDirectKick);
+        log.Write("CONFIG EFFECTIVE [VehicleCrash] ContactKickDecay=%.6f", vehicleContactKickDecay);
+        log.Write("CONFIG EFFECTIVE [VehicleCrash] ContactCooldownMs=%lu", static_cast<unsigned long>(vehicleContactCooldownMs));
+        log.Write("CONFIG EFFECTIVE [VehicleCrash] DamageResponse=%d", vehicleCrashDamageEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [VehicleCrash] DamageThreshold=%.6f", vehicleCrashDamageThreshold);
+        log.Write("CONFIG EFFECTIVE [VehicleCrash] DamageReference=%.6f", vehicleCrashDamageReference);
+        log.Write("CONFIG EFFECTIVE [VehicleCrash] DamageStrength=%.6f", vehicleCrashDamageStrength);
+        log.Write("CONFIG EFFECTIVE [VehicleCrash] FrontMultiplier=%.6f", vehicleCrashFrontMultiplier);
+        log.Write("CONFIG EFFECTIVE [VehicleCrash] RearMultiplier=%.6f", vehicleCrashRearMultiplier);
+        log.Write("CONFIG EFFECTIVE [VehicleCrash] SideMultiplier=%.6f", vehicleCrashSideMultiplier);
+        log.Write("CONFIG EFFECTIVE [VehicleCrash] VerticalMultiplier=%.6f", vehicleCrashVerticalMultiplier);
+        log.Write("CONFIG EFFECTIVE [VehicleCrash] CatastrophicThreshold=%.6f", vehicleCrashCatastrophicThreshold);
+        log.Write("CONFIG EFFECTIVE [VehicleCrash] CatastrophicMultiplier=%.6f", vehicleCrashCatastrophicMultiplier);
+        log.Write("CONFIG EFFECTIVE [VehicleCrash] PhysicsWindowMs=%lu", static_cast<unsigned long>(vehicleCrashPhysicsWindowMs));
+        log.Write("CONFIG EFFECTIVE [VehicleCrash] SuspensionResponse=%d", vehicleSuspensionEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [VehicleCrash] SuspensionThreshold=%.6f", vehicleSuspensionThreshold);
+        log.Write("CONFIG EFFECTIVE [VehicleCrash] SuspensionStrength=%.6f", vehicleSuspensionStrength);
+        log.Write("CONFIG EFFECTIVE [VehicleCrash] AdaptiveHandling=%d", vehicleSuspensionAdaptiveHandling ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [VehicleCrash] HandlingInfluence=%.6f", vehicleSuspensionHandlingInfluence);
+        log.Write("CONFIG EFFECTIVE [Vehicle] Spring=%.6f", vehicleSpring);
+        log.Write("CONFIG EFFECTIVE [Vehicle] Damping=%.6f", vehicleDamping);
+        log.Write("CONFIG EFFECTIVE [Vehicle] MaxSide=%.6f", vehicleMaxSide);
+        log.Write("CONFIG EFFECTIVE [Vehicle] MaxVertical=%.6f", vehicleMaxVertical);
+        log.Write("CONFIG EFFECTIVE [Vehicle] MaxForward=%.6f", vehicleMaxForward);
+        log.Write("CONFIG EFFECTIVE [VehicleProfiles] Automobile=%.6f", vehicleAutomobileScale);
+        log.Write("CONFIG EFFECTIVE [VehicleProfiles] Bike=%.6f", vehicleBikeScale);
+        log.Write("CONFIG EFFECTIVE [VehicleProfiles] Boat=%.6f", vehicleBoatScale);
+        log.Write("CONFIG EFFECTIVE [VehicleProfiles] Helicopter=%.6f", vehicleHeliScale);
+        log.Write("CONFIG EFFECTIVE [VehicleProfiles] Plane=%.6f", vehiclePlaneScale);
+        log.Write("CONFIG EFFECTIVE [VehicleProfiles] Other=%.6f", vehicleOtherScale);
+        log.Write("CONFIG EFFECTIVE [Alive] IdleSide=%.6f", idleSide);
+        log.Write("CONFIG EFFECTIVE [Alive] IdleVertical=%.6f", idleVertical);
+        log.Write("CONFIG EFFECTIVE [Alive] IdleForward=%.6f", idleForward);
+        log.Write("CONFIG EFFECTIVE [Alive] SettleDelay=%.6f", idleSettleDelay);
+        log.Write("CONFIG EFFECTIVE [Alive] SettledScale=%.6f", idleSettledScale);
+        log.Write("CONFIG EFFECTIVE [Alive] AimBreathingSide=%.6f", aimBreathingSide);
+        log.Write("CONFIG EFFECTIVE [Alive] AimBreathingVertical=%.6f", aimBreathingVertical);
+        log.Write("CONFIG EFFECTIVE [Alive] AimBreathingForward=%.6f", aimBreathingForward);
+        log.Write("CONFIG EFFECTIVE [Alive] AimBreathingRate=%.6f", aimBreathingRate);
+        log.Write("CONFIG EFFECTIVE [Gait] Side=%.6f", gaitSide);
+        log.Write("CONFIG EFFECTIVE [Gait] Vertical=%.6f", gaitVertical);
+        log.Write("CONFIG EFFECTIVE [Gait] Forward=%.6f", gaitForward);
+        log.Write("CONFIG EFFECTIVE [Gait] Fallback=%.6f", fallbackGait);
+        log.Write("CONFIG EFFECTIVE [Gait] StepImpulse=%.6f", stepImpulse);
+        log.Write("CONFIG EFFECTIVE [SurfaceSteps] Road=%.6f", surfaceRoad);
+        log.Write("CONFIG EFFECTIVE [SurfaceSteps] Concrete=%.6f", surfaceConcrete);
+        log.Write("CONFIG EFFECTIVE [SurfaceSteps] Gravel=%.6f", surfaceGravel);
+        log.Write("CONFIG EFFECTIVE [SurfaceSteps] Grass=%.6f", surfaceGrass);
+        log.Write("CONFIG EFFECTIVE [SurfaceSteps] Dirt=%.6f", surfaceDirt);
+        log.Write("CONFIG EFFECTIVE [SurfaceSteps] Sand=%.6f", surfaceSand);
+        log.Write("CONFIG EFFECTIVE [SurfaceSteps] Wood=%.6f", surfaceWood);
+        log.Write("CONFIG EFFECTIVE [SurfaceSteps] Metal=%.6f", surfaceMetal);
+        log.Write("CONFIG EFFECTIVE [SurfaceSteps] Rock=%.6f", surfaceRock);
+        log.Write("CONFIG EFFECTIVE [SurfaceSteps] Misc=%.6f", surfaceMisc);
+        log.Write("CONFIG EFFECTIVE [Look] YawInertia=%.6f", lookYaw);
+        log.Write("CONFIG EFFECTIVE [Look] PitchInertia=%.6f", lookPitch);
+        log.Write("CONFIG EFFECTIVE [Look] TurnInput=%.6f", turnInput);
+        log.Write("CONFIG EFFECTIVE [Look] AccelerationInertia=%.6f", accelInertia);
+        log.Write("CONFIG EFFECTIVE [Movement] DirectionalInertia=%.6f", directionalInertia);
+        log.Write("CONFIG EFFECTIVE [Movement] StrafeSway=%.6f", strafeSway);
+        log.Write("CONFIG EFFECTIVE [Movement] BackwardSway=%.6f", backwardSway);
+        log.Write("CONFIG EFFECTIVE [Impact] JumpImpulse=%.6f", jumpImpulse);
+        log.Write("CONFIG EFFECTIVE [Impact] LandingImpulse=%.6f", landingImpulse);
+        log.Write("CONFIG EFFECTIVE [Impact] HardLandingScale=%.6f", hardLandingScale);
+        log.Write("CONFIG EFFECTIVE [Impact] DamageImpulse=%.6f", damageImpulse);
+        log.Write("CONFIG EFFECTIVE [Impact] DamageSideImpulse=%.6f", damageSideImpulse);
+        log.Write("CONFIG EFFECTIVE [Impact] ExplosionImpulse=%.6f", explosionImpulse);
+        log.Write("CONFIG EFFECTIVE [Impact] ExplosionRadius=%.6f", explosionRadius);
+        log.Write("CONFIG EFFECTIVE [Impact] MaxImpactOffset=%.6f", maxImpactOffset);
+        log.Write("CONFIG EFFECTIVE [Impact] MaxFinalSide=%.6f", maxFinalSide);
+        log.Write("CONFIG EFFECTIVE [Impact] MaxFinalVertical=%.6f", maxFinalVertical);
+        log.Write("CONFIG EFFECTIVE [Impact] MaxFinalForward=%.6f", maxFinalForward);
+        log.Write("CONFIG EFFECTIVE [Impact] MeleeImpact=%.6f", meleeImpact);
+        log.Write("CONFIG EFFECTIVE [Impact] MeleeSide=%.6f", meleeSide);
+        log.Write("CONFIG EFFECTIVE [Melee] DetailedPlayerResponse=%d", detailedPlayerMelee ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [Melee] PunchWindup=%.6f", punchWindup);
+        log.Write("CONFIG EFFECTIVE [Melee] PunchRelease=%.6f", punchRelease);
+        log.Write("CONFIG EFFECTIVE [Melee] PunchContact=%.6f", punchContact);
+        log.Write("CONFIG EFFECTIVE [Melee] PunchSide=%.6f", punchSide);
+        log.Write("CONFIG EFFECTIVE [Melee] PunchVertical=%.6f", punchVertical);
+        log.Write("CONFIG EFFECTIVE [Melee] PunchReleasePhase=%.6f", punchReleasePhase);
+        log.Write("CONFIG EFFECTIVE [Melee] KickWindup=%.6f", kickWindup);
+        log.Write("CONFIG EFFECTIVE [Melee] KickRelease=%.6f", kickRelease);
+        log.Write("CONFIG EFFECTIVE [Melee] KickContact=%.6f", kickContact);
+        log.Write("CONFIG EFFECTIVE [Melee] KickSide=%.6f", kickSide);
+        log.Write("CONFIG EFFECTIVE [Melee] KickVertical=%.6f", kickVertical);
+        log.Write("CONFIG EFFECTIVE [Melee] KickReleasePhase=%.6f", kickReleasePhase);
+        log.Write("CONFIG EFFECTIVE [Melee] ComboStep=%.6f", meleeComboStep);
+        log.Write("CONFIG EFFECTIVE [Melee] ComboMaxScale=%.6f", meleeComboMaxScale);
+        log.Write("CONFIG EFFECTIVE [Rotation] IdlePitchDeg=%.6f", idlePitchDeg);
+        log.Write("CONFIG EFFECTIVE [Rotation] IdleRollDeg=%.6f", idleRollDeg);
+        log.Write("CONFIG EFFECTIVE [Rotation] GaitPitchDeg=%.6f", gaitPitchDeg);
+        log.Write("CONFIG EFFECTIVE [Rotation] GaitRollDeg=%.6f", gaitRollDeg);
+        log.Write("CONFIG EFFECTIVE [Rotation] TurnRollDeg=%.6f", turnRollDeg);
+        log.Write("CONFIG EFFECTIVE [Rotation] LookYawDeg=%.6f", lookYawDeg);
+        log.Write("CONFIG EFFECTIVE [Rotation] LookPitchDeg=%.6f", lookPitchDeg);
+        log.Write("CONFIG EFFECTIVE [Rotation] MaxPitchDeg=%.6f", maxPitchDeg);
+        log.Write("CONFIG EFFECTIVE [Rotation] MaxRollDeg=%.6f", maxRollDeg);
+        log.Write("CONFIG EFFECTIVE [Rotation] MaxYawDeg=%.6f", maxYawDeg);
+        log.Write("CONFIG EFFECTIVE [Recoil] Enabled=%d", recoilEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [Recoil] Strength=%.6f", recoilStrength);
+        log.Write("CONFIG EFFECTIVE [Recoil] VerticalKick=%.6f", recoilVerticalKick);
+        log.Write("CONFIG EFFECTIVE [Recoil] ForwardKick=%.6f", recoilForwardKick);
+        log.Write("CONFIG EFFECTIVE [Recoil] SideKick=%.6f", recoilSideKick);
+        log.Write("CONFIG EFFECTIVE [Recoil] PositionVertical=%.6f", recoilPositionVertical);
+        log.Write("CONFIG EFFECTIVE [Recoil] PositionForward=%.6f", recoilPositionForward);
+        log.Write("CONFIG EFFECTIVE [Recoil] PositionSide=%.6f", recoilPositionSide);
+        log.Write("CONFIG EFFECTIVE [Recoil] VelocityVertical=%.6f", recoilVelocityVertical);
+        log.Write("CONFIG EFFECTIVE [Recoil] VelocityForward=%.6f", recoilVelocityForward);
+        log.Write("CONFIG EFFECTIVE [Recoil] VelocitySide=%.6f", recoilVelocitySide);
+        log.Write("CONFIG EFFECTIVE [RecoilProfiles] Pistol=%.6f", recoilPistol);
+        log.Write("CONFIG EFFECTIVE [RecoilProfiles] DesertEagle=%.6f", recoilDeagle);
+        log.Write("CONFIG EFFECTIVE [RecoilProfiles] SMG=%.6f", recoilSmg);
+        log.Write("CONFIG EFFECTIVE [RecoilProfiles] Rifle=%.6f", recoilRifle);
+        log.Write("CONFIG EFFECTIVE [RecoilProfiles] Shotgun=%.6f", recoilShotgun);
+        log.Write("CONFIG EFFECTIVE [RecoilProfiles] Sniper=%.6f", recoilSniper);
+        log.Write("CONFIG EFFECTIVE [RecoilProfiles] Launcher=%.6f", recoilLauncher);
+        log.Write("CONFIG EFFECTIVE [RecoilProfiles] Flamethrower=%.6f", recoilFlamethrower);
+        log.Write("CONFIG EFFECTIVE [RecoilProfiles] Minigun=%.6f", recoilMinigun);
+        log.Write("CONFIG EFFECTIVE [Recoil] FirstShotMultiplier=%.6f", firstShotMultiplier);
+        log.Write("CONFIG EFFECTIVE [Recoil] SustainedShotMultiplier=%.6f", sustainedShotMultiplier);
+        log.Write("CONFIG EFFECTIVE [Recoil] SustainedResetMs=%lu", static_cast<unsigned long>(sustainedResetMs));
+        log.Write("CONFIG EFFECTIVE [Recoil] MinIntervalMs=%lu", static_cast<unsigned long>(recoilMinIntervalMs));
+        log.Write("CONFIG EFFECTIVE [Smoothing] Spring=%.6f", spring);
+        log.Write("CONFIG EFFECTIVE [Smoothing] Damping=%.6f", damping);
+        log.Write("CONFIG EFFECTIVE [Smoothing] LookSpring=%.6f", lookSpring);
+        log.Write("CONFIG EFFECTIVE [Smoothing] LookDamping=%.6f", lookDamping);
+        log.Write("CONFIG EFFECTIVE [Smoothing] StateResponse=%.6f", stateResponse);
+        log.Write("CONFIG EFFECTIVE [Smoothing] FootPhaseResponse=%.6f", footPhaseResponse);
+        log.Write("CONFIG EFFECTIVE [Smoothing] RecoilSpringMultiplier=%.6f", recoilSpringMultiplier);
+        log.Write("CONFIG EFFECTIVE [Smoothing] RecoilDampingMultiplier=%.6f", recoilDampingMultiplier);
+        log.Write("CONFIG EFFECTIVE [Smoothing] IdleDampingMultiplier=%.6f", idleDampingMultiplier);
+        log.Write("CONFIG EFFECTIVE [Debug] Enabled=%d", debug ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [Debug] LogEveryMs=%lu", static_cast<unsigned long>(logEveryMs));
+        log.Write("CONFIG EFFECTIVE [Debug] LogStepEvents=%d", logSteps ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [Debug] LogShotEvents=%d", logShots ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [Debug] OverlayEnabled=%d", overlayEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [Debug] OverlayScale=%.3f", overlayScale);
+        log.Write("CONFIG EFFECTIVE [DebugAudit] Enabled=%d", auditEnabled ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [DebugAudit] LogConfigValues=%d", auditConfigValues ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [DebugAudit] LogFunctionCalls=%d", auditFunctionCalls ? 1 : 0);
+        log.Write("CONFIG EFFECTIVE [DebugAudit] SummaryEveryMs=%lu", static_cast<unsigned long>(auditEveryMs));
+        log.Write("CONFIG EFFECTIVE [Performance] NearbyVehicleScanMs=%lu", static_cast<unsigned long>(nearbyVehicleScanMs));
+        log.Write("CONFIG EFFECTIVE [Performance] SurfaceScanMs=%lu", static_cast<unsigned long>(surfaceScanMs));
+        log.Write("CONFIG EFFECTIVE [General] Preset=%s", presetName);
+        log.Write(
+            "PRESET CHARACTER move=%.2f combat=%.2f vehicle=%.2f world=%.2f "
+            "fov=%.2f ambient=%.2f impact=%.2f recoil=%.2f melee=%.2f "
+            "landing=%.2f rotation=%.2f recovery=%.2f",
+            presetMovement,
+            presetCombat,
+            presetVehicle,
+            presetWorld,
+            presetFov,
+            presetAmbient,
+            presetImpact,
+            presetRecoil,
+            presetMelee,
+            presetLanding,
+            presetRotation,
+            presetRecovery
+        );
+        for (int id = 22; id <= 38; ++id) {
+            log.Write("CONFIG EFFECTIVE [WeaponRecoil] Weapon%dScale=%.6f", id, weaponScale[id]);
+            log.Write("CONFIG EFFECTIVE [WeaponRecoil] Weapon%dVertical=%.6f", id, weaponVertical[id]);
+            log.Write("CONFIG EFFECTIVE [WeaponRecoil] Weapon%dForward=%.6f", id, weaponForward[id]);
+            log.Write("CONFIG EFFECTIVE [WeaponRecoil] Weapon%dSide=%.6f", id, weaponSide[id]);
+            log.Write("CONFIG EFFECTIVE [WeaponRecoil] Weapon%dRecovery=%.6f", id, weaponRecovery[id]);
+        }
+        log.Write("CONFIG AUDIT END effective-values");
+    }
+
+};
 
 enum class MotionState {
     Disabled,
@@ -361,29 +2233,68 @@ const char* MotionName(MotionState s) {
     }
 }
 
+// GetDpiForWindow is optional on older Windows; query it dynamically.
+static unsigned GetOverlayWindowDpi() {
+    static unsigned cachedDpi = 96;
+    static DWORD lastProbe = 0;
+    const DWORD now = GetTickCount();
+    if (lastProbe != 0 && now - lastProbe < 1000u)
+        return cachedDpi;
+    lastProbe = now;
+
+    HWND hwnd = RsGlobal.ps ? reinterpret_cast<HWND>(RsGlobal.ps->window) : nullptr;
+    if (!hwnd || !IsWindow(hwnd))
+        return cachedDpi;
+
+    using GetDpiForWindowFn = UINT (WINAPI*)(HWND);
+    const HMODULE user32 = GetModuleHandleA("user32.dll");
+    const auto getDpi = user32
+        ? reinterpret_cast<GetDpiForWindowFn>(GetProcAddress(user32, "GetDpiForWindow"))
+        : nullptr;
+    UINT dpi = getDpi ? getDpi(hwnd) : 0;
+    if (dpi == 0) {
+        HDC dc = GetDC(hwnd);
+        if (dc) {
+            dpi = static_cast<UINT>(GetDeviceCaps(dc, LOGPIXELSY));
+            ReleaseDC(hwnd, dc);
+        }
+    }
+    cachedDpi = (dpi >= 72 && dpi <= 480) ? dpi : 96u;
+    return cachedDpi;
+}
+
 class CameraResponse {
 public:
-    void InitializeRuntime() {
+    void InitializeRuntime(const char* source) {
         if (runtimeInitialized_ || runtimeInitAttempted_)
             return;
 
         runtimeInitAttempted_ = true;
 
         cfg_.dir = Config::ModuleDirectory();
-        cr::ReloadConfigFresh(cfg_);
+        cfg_.Load();
 
-        // If the ASI path could not be resolved, allow a later retry instead of
-        // silently binding to GTA's working directory.
+        // Keep the config path tied to the loaded ASI, not GTA's working directory.
         if (cfg_.dir.empty() || cfg_.iniPath.empty()) {
+            OutputDebugStringA("CameraResponse: cannot resolve loaded ASI directory.\n");
             runtimeInitAttempted_ = false;
             return;
         }
 
-        log_.Init(cfg_.dir, cfg_.debug || cfg_.auditEnabled || cfg_.scanProfilingEnabled);
-        log_.Write(
-            "PLUGIN INITIALIZING (plugin-sdk game event). asiDir=%s ini=%s",
-            cfg_.dir.c_str(),
-            cfg_.iniPath.c_str()
+        log_.Init(cfg_.dir, cfg_.debug || cfg_.auditEnabled);
+        const DWORD iniAttributes = GetFileAttributesA(cfg_.iniPath.c_str());
+        const bool iniPresent = iniAttributes != INVALID_FILE_ATTRIBUTES &&
+            !(iniAttributes & FILE_ATTRIBUTE_DIRECTORY);
+
+        log_.WriteImportant(
+            "START event=%s asiDir=%s ini=%s iniPresent=%d log=%s",
+            source, cfg_.dir.c_str(), cfg_.iniPath.c_str(),
+            iniPresent ? 1 : 0, log_.Path().c_str()
+        );
+        log_.WriteImportant(
+            "CONFIG enabled=%d debug=%d audit=%d preset=%s",
+            cfg_.enabled ? 1 : 0, cfg_.debug ? 1 : 0,
+            cfg_.auditEnabled ? 1 : 0, cfg_.presetName
         );
         log_.Write(
             "AUDIT MODE enabled=%d configValues=%d functionCalls=%d summaryEveryMs=%u",
@@ -394,43 +2305,34 @@ public:
         );
         cfg_.DumpEffectiveValues(log_);
         log_.Flush();
-        // Install the stock third-person camera commit redirection plus the
-        // event after ASI load-order hooks have already been established.
+
+        // Hook only after a game callback; unsupported executables must not be patched.
         InstallCameraCommitHook();
-        InstallWaterCannonHook();
+        if (cameraCommitHookInstalled_)
+            InstallWaterCannonHook();
 
         runtimeInitialized_ = true;
 
-        log_.Write(
-            "runtime initialized from %s; camera commit hook=%d "
-            "camera integration=stock",
-            cfg_.dir.c_str(),
-            cameraCommitHookInstalled_ ? 1 : 0
+        log_.WriteImportant(
+            "READY cameraHook=%d enabled=%d (0 means no camera effects; check game version or hook conflicts)",
+            cameraCommitHookInstalled_ ? 1 : 0, cfg_.enabled ? 1 : 0
         );
-        log_.Flush();
     }
 
     CameraResponse() {
         instance_ = this;
+        OutputDebugStringA("CameraResponse: ASI loaded; waiting for game callbacks.\n");
 
-        // Follow plugin-sdk's normal plugin lifetime: the static constructor
-        // only registers callbacks. File I/O, game-memory validation, and the
-        // one required camera CALL redirection happen later from
-        // gameProcessEvent, outside the Windows loader lock.
+        // Register callbacks during static construction; defer I/O, validation and patching beyond
+        // loader lock.
         Events::gameProcessEvent += [] {
-            if (!instance_)
-                return;
-
-            if (!instance_->runtimeInitialized_)
-                instance_->InitializeRuntime();
-
-            if (instance_->runtimeInitialized_)
-                instance_->GameUpdate();
+            if (instance_)
+                instance_->OnGameProcessEvent();
         };
 
         Events::drawingEvent += [] {
-            if (instance_ && instance_->runtimeInitialized_)
-                instance_->RenderDebugOverlay();
+            if (instance_)
+                instance_->OnDrawingEvent();
         };
 
         Events::restartGameEvent += [] {
@@ -445,6 +2347,87 @@ public:
     }
 
     ~CameraResponse() = default;
+
+    void OnGameProcessEvent() {
+        if (!runtimeInitialized_)
+            InitializeRuntime("gameProcessEvent");
+        if (!runtimeInitialized_)
+            return;
+
+        ++primaryCallbackCount_;
+        if (primaryCallbackCount_ == 1)
+            log_.WriteImportant("GAME PROCESS callback active frame=%u", CTimer::m_FrameCounter);
+        const cr::UpdateDispatch::Source before = updateDispatch_.ActiveSource();
+        if (!updateDispatch_.OnGameProcess(CTimer::m_FrameCounter))
+            return;
+
+        if (before == cr::UpdateDispatch::Source::DrawingFallback)
+            log_.WriteImportant("UPDATE SOURCE recovered=gameProcessEvent frame=%u", CTimer::m_FrameCounter);
+        GameUpdate();
+    }
+
+    void OnDrawingEvent() {
+        if (!runtimeInitialized_)
+            InitializeRuntime("drawingEvent");
+        if (!runtimeInitialized_)
+            return;
+
+        ++drawingCallbackCount_;
+        // Do not invoke game simulation while the main menu, pause menu,
+        // or character/world are unavailable.
+        const bool gameplayReady =
+            !CTimer::m_UserPause && !CTimer::m_CodePause &&
+            !FrontEndMenuManager.m_bMenuActive &&
+            CTimer::ms_fTimeStep > 0.0f &&
+            FindPlayerPed() != nullptr &&
+            static_cast<unsigned>(TheCamera.m_nActiveCam) <
+                sizeof(TheCamera.m_aCams) / sizeof(TheCamera.m_aCams[0]);
+
+        const cr::UpdateDispatch::Source previousSource = updateDispatch_.ActiveSource();
+        const bool fallbackTick =
+            updateDispatch_.OnDrawing(CTimer::m_FrameCounter, gameplayReady);
+        if (fallbackTick) {
+            if (previousSource != cr::UpdateDispatch::Source::DrawingFallback) {
+                log_.WriteImportant(
+                    "UPDATE SOURCE drawingEvent fallback enabled frame=%u primaryCallbacks=%llu",
+                    CTimer::m_FrameCounter,
+                    static_cast<unsigned long long>(primaryCallbackCount_)
+                );
+            }
+            ++fallbackUpdateCount_;
+            GameUpdate();
+        }
+
+        const DWORD now = GetTickCount();
+        if (lastDrawingHeartbeatMs_ == 0 || now - lastDrawingHeartbeatMs_ >= 5000u) {
+            lastDrawingHeartbeatMs_ = now;
+            log_.WriteImportant(
+                "DRAW HEARTBEAT frame=%u draws=%llu processCalls=%llu updates=%llu "
+                "fallbackUpdates=%llu gameplayReady=%d source=%s "
+                "prepared=%llu commit=%llu applied=%llu gate=%s",
+                CTimer::m_FrameCounter,
+                static_cast<unsigned long long>(drawingCallbackCount_),
+                static_cast<unsigned long long>(primaryCallbackCount_),
+                static_cast<unsigned long long>(updates_),
+                static_cast<unsigned long long>(fallbackUpdateCount_),
+                gameplayReady ? 1 : 0,
+                UpdateSourceName(),
+                static_cast<unsigned long long>(prepared_),
+                static_cast<unsigned long long>(commitCalls_),
+                static_cast<unsigned long long>(commitApplied_),
+                lastGate_.empty() ? "-" : lastGate_.c_str()
+            );
+        }
+        RenderDebugOverlay();
+    }
+
+    const char* UpdateSourceName() const {
+        switch (updateDispatch_.ActiveSource()) {
+        case cr::UpdateDispatch::Source::GameProcess: return "GAME";
+        case cr::UpdateDispatch::Source::DrawingFallback: return "DRAW-FALLBACK";
+        default: return "WAIT";
+        }
+    }
 
     bool GetCurrentOffset(float* side, float* vertical, float* forward) const {
         if (side) *side = pendingSide_;
@@ -461,8 +2444,7 @@ public:
     }
 
     void SetExternalScale(float scale) {
-        if (std::isfinite(scale))
-            externalScale_ = Clamp(scale, 0.0f, 2.0f);
+        externalScale_ = Clamp(scale, 0.0f, 2.0f);
     }
 
     bool QueueExternalImpulse(
@@ -474,12 +2456,6 @@ public:
         unsigned sourceTag,
         unsigned ttlMs
     ) {
-        // External callers may send NaN/Inf. Reject them before Clamp and
-        // spring integration; comparisons alone do not sanitize NaN.
-        if (!std::isfinite(side) || !std::isfinite(vertical) ||
-            !std::isfinite(forward) || !std::isfinite(priority))
-            return false;
-
         ExternalImpulseV2 impulse{};
         impulse.side = Clamp(side, -1.0f, 1.0f);
         impulse.vertical = Clamp(vertical, -1.0f, 1.0f);
@@ -641,9 +2617,8 @@ private:
         event.priorityClass=priorityClass;
         event.tag=tag;
         ++transientEventsSubmitted_;
-        const unsigned droppedBefore = transientEvents_.Dropped();
-        transientEvents_.Publish(event);
-        transientEventsDropped_ += transientEvents_.Dropped() - droppedBefore;
+        if (!transientEvents_.Publish(event))
+            ++transientEventsDropped_;
     }
 
     void CommitTransientEvents() {
@@ -1060,34 +3035,6 @@ private:
     unsigned long long auditCalls_[AUD_FUNCTION_COUNT] = {};
     unsigned long long auditPrevious_[AUD_FUNCTION_COUNT] = {};
     unsigned lastAuditSummaryMs_ = 0;
-    cr::ScanProfiler scanProfiler_{};
-    unsigned lastScanProfileMs_ = 0;
-
-    void ReportScanProfiles() {
-        if (!cfg_.scanProfilingEnabled)
-            return;
-
-        const unsigned now = CTimer::m_snTimeInMilliseconds;
-        if (lastScanProfileMs_ != 0 &&
-            now - lastScanProfileMs_ < cfg_.scanProfileEveryMs)
-            return;
-
-        lastScanProfileMs_ = now;
-        for (unsigned i = 0; i < cr::ScanProfiler::kCount; ++i) {
-            const auto kind = static_cast<cr::ScanKind>(i);
-            const cr::ScanProfile& sample = scanProfiler_.Get(kind);
-            if (!sample.calls)
-                continue;
-            log_.Write("SCAN PROFILE name=%s calls=%llu totalUs=%llu avgUs=%llu peakUs=%llu windowMs=%u",
-                cr::ScanKindName(kind),
-                static_cast<unsigned long long>(sample.calls),
-                static_cast<unsigned long long>(sample.totalUs),
-                static_cast<unsigned long long>(sample.totalUs / sample.calls),
-                static_cast<unsigned long long>(sample.peakUs),
-                cfg_.scanProfileEveryMs);
-        }
-        scanProfiler_.Reset();
-    }
 
     using WsfGetCurrentFovFn = void (__cdecl*)(float*);
     using WsfSetFovMultiplierFn = void (__cdecl*)(void*, float);
@@ -1108,7 +3055,7 @@ private:
     float nativeFovApplied_ = 70.0f;
     bool nativeFovOwned_ = false;
 
-    // Shared GTA camera-copy signature. Keep this declaration before both
+    // Camera copy signature shared by hook and original-function pointer.
     using CopyCameraFn = void(__thiscall*)(CCamera*, bool);
 
 
@@ -1122,9 +3069,7 @@ private:
     MotionSpring recoilSpring_;
     MotionSpring impactSpring_;
 
-    // Unified v1.0 event/mixing layer. Legacy detectors still feed their
-    // dedicated springs, while cross-cutting/new responses publish here so
-    // source/frequency telemetry and future extensions share one contract.
+    // Common event mixer aggregates legacy/new layers and diagnostic telemetry.
     cr::FrameResponseMixer responseMixer_;
     cr::BandLimitedNoise idleNoiseSide_{0x13579BDFu};
     cr::BandLimitedNoise idleNoiseVertical_{0x2468ACE1u};
@@ -1531,7 +3476,6 @@ private:
 
     uint32_t rng_ = 0xA9137C21u;
 
-    // Prepared camera-local translation.
     bool pendingAllowed_ = false;
     float pendingSide_ = 0.0f;
     float pendingVertical_ = 0.0f;
@@ -1541,8 +3485,7 @@ private:
     float pendingRollRad_ = 0.0f;
     float pendingYawRad_ = 0.0f;
 
-    // Stock third-person camera commit:
-    // CCamera::Process -> call CopyCameraMatrixToRWCam at 0x52C98B (US 1.0).
+    // US 1.0 camera commit: CCamera::Process -> CopyCameraMatrixToRWCam (CALL 0x52C98B).
     static CopyCameraFn originalCopyCamera_;
 
     bool cameraCommitHookInstalled_ = false;
@@ -1555,6 +3498,16 @@ private:
     unsigned lastStatusMs_ = 0;
     std::string lastGate_;
 
+    cr::UpdateDispatch updateDispatch_;
+    uint64_t primaryCallbackCount_ = 0;
+    uint64_t drawingCallbackCount_ = 0;
+    uint64_t fallbackUpdateCount_ = 0;
+    DWORD lastDrawingHeartbeatMs_ = 0;
+
+    int overlayWidth_ = 0;
+    int overlayHeight_ = 0;
+    unsigned overlayDpi_ = 0;
+    float overlayScaleLogged_ = 0.0f;
     uint64_t updates_ = 0;
     uint64_t prepared_ = 0;
     uint64_t commitCalls_ = 0;
@@ -1643,11 +3596,7 @@ private:
 
         CMatrix& vm = vehicle->GetMatrix();
 
-        // GTA SA vehicle basis:
-        //   right = local +X
-        //   up    = local +Y / vehicle forward
-        // Convert only the horizontal component. Vertical/heave is handled
-        // separately so camera pitch cannot feed back into longitudinal motion.
+        // Vehicle basis: right=+X, forward=+Y; convert planar motion, heave separately.
         const float worldX =
             vm.right.x * vehicleSide +
             vm.up.x * vehicleForward;
@@ -1687,8 +3636,7 @@ private:
         if (!weapon || !IsMeleeWeaponType(weapon->m_eWeaponType))
             return false;
 
-        // GTA's reconciled target state covers controller lock-on after input
-        // mapping. bIsAimingGun can also remain set by targeting tasks.
+        // Use reconciled targeting state for mapped controller lock-on and aiming tasks.
         return (pad && pad->GetTarget()) || p->bIsAimingGun;
     }
 
@@ -1973,7 +3921,6 @@ private:
         const bool actuallyInVehicle =
             context.inVehicle;
 
-        // First-person camera modes are intentionally excluded.
         if (context.firstPerson)
             return "first-person";
 
@@ -2042,7 +3989,6 @@ private:
         if (!lastContextIndoorScanMs_ ||
             now-lastContextIndoorScanMs_>=cfg_.contextIndoorScanMs) {
             lastContextIndoorScanMs_=now;
-            cr::ScopedScanProfile scanScope(scanProfiler_, cr::ScanKind::IndoorRay, cfg_.scanProfilingEnabled);
             CVector from=p->GetPosition(); from.z+=0.8f;
             CVector to=from; to.z+=cfg_.contextIndoorCeilingHeight;
             CColPoint hit{}; CEntity* blocker=nullptr;
@@ -2079,7 +4025,7 @@ private:
     }
 
     float SurfaceMultiplier(unsigned id) const {
-        // GTA SA collision material families. Unknown/modded IDs stay neutral.
+        // Unknown or modded surface material IDs use neutral handling.
         if (id <= 3) return cfg_.surfaceRoad;
         if ((id >= 4 && id <= 5) || (id >= 7 && id <= 8) || id == 34 || id == 89 ||
             (id >= 127 && id <= 139) || id == 144) return cfg_.surfaceConcrete;
@@ -2120,8 +4066,7 @@ private:
     }
 
     float CollisionMaterialMultiplier(unsigned id) const {
-        // Sharper rigid materials transfer more camera energy; soft/loose
-        // surfaces absorb some of it. Influence is blended in UpdateVehicle.
+        // Hard surfaces transmit stronger vibration; soft surfaces absorb it.
         if (id >= 50 && id <= 57) return 1.18f; // metal
         if ((id <= 8) || id == 34 || id == 89 ||
             (id >= 127 && id <= 144)) return 1.12f; // road/concrete
@@ -2153,7 +4098,6 @@ private:
         }
 
         lastSurfaceScanMs_ = now;
-        cr::ScopedScanProfile scanScope(scanProfiler_, cr::ScanKind::GroundSurface, cfg_.scanProfilingEnabled);
         currentSurfaceId_ = 0;
         currentSurfaceMultiplier_ = 1.0f;
 
@@ -2175,9 +4119,7 @@ private:
     static bool WeaponSupportsCameraRecoil(eWeaponType type) {
         const int id = static_cast<int>(type);
 
-        // GTA SA firearm / launcher range:
-        // 22 pistols ... 38 minigun/flamethrower group.
-        // Melee, thrown items, spraycan/camera/etc. are intentionally ignored.
+        // Stock firearm/launcher IDs 22..38; ignore melee/tools/thrown weapons.
         return id >= 22 && id <= 38 && id != 37;
     }
 
@@ -2257,10 +4199,7 @@ private:
                     contextScale *= cfg_.recoilMovingScale;
                 }
 
-                // Dual-wield weapon skills in SA predominantly affect pistols
-                // and compact SMGs. We cannot safely depend on private skill
-                // fields here, so use the active weapon model's second-gun
-                // animation flag when available through the stock weapon info.
+                // Infer dual wield via weapon animation metadata, not private skill fields.
                 const unsigned char weaponSkill =
                     static_cast<unsigned char>(
                         player->GetWeaponSkill(type)
@@ -2295,9 +4234,7 @@ private:
         currentRecoilRecovery_ =
             (weaponId >= 0 && weaponId < 47) ? cfg_.weaponRecovery[weaponId] : 1.0f;
 
-        // If a weapon consumes more than one ammo unit in a single game
-        // update, increase the response slightly, but do not make automatics
-        // explode the camera.
+        // Bound multishot gain so large ammo deltas cannot produce excessive recoil.
         const float burst =
             1.0f +
             0.18f *
@@ -2311,9 +4248,8 @@ private:
             cfg_.presetRecoil;
         TouchResponseSource(cr::ResponseOrigin::Recoil, s, 700);
 
-        // Direct spring displacement gives an immediate visible shot response.
-        // Velocity then carries it into a short damped return. This never
-        // changes the camera orientation matrix, avoiding visual corruption.
+        // Direct displacement gives instant recoil; velocity creates damped recovery without rotating
+        // GTA's matrix.
         const float sideSign = RandomSigned();
 
         {
@@ -2353,9 +4289,7 @@ private:
             sideMul *
             s;
 
-        // High-level Kick controls are an additional explicit per-shot impulse
-        // layer. They were previously read from the INI but never consumed,
-        // making VerticalKick/ForwardKick/SideKick dead settings.
+        // Per-shot Kick values add explicit impulses alongside weapon profiles.
         recoilSpring_.vertical.AddImpulse(
             cfg_.recoilVerticalKick *
             verticalMul *
@@ -2373,8 +4307,7 @@ private:
             s
         );
 
-        // Hard per-shot state guards. Even a bad modded weapon definition
-        // cannot accumulate enough recoil to break the camera.
+        // Clamp per-shot state even when modded weapon data is malformed.
         recoilSpring_.vertical.position =
             Clamp(recoilSpring_.vertical.position, -0.08f, 0.18f);
 
@@ -2456,10 +4389,7 @@ private:
 
         const unsigned now = CTimer::m_snTimeInMilliseconds;
 
-        // Bone vertical velocity can contain multiple local minima during one
-        // planted-foot animation. The old code accepted each minimum as a new
-        // touchdown, producing LEFT/LEFT or RIGHT/RIGHT bursts ~100 ms apart
-        // and even two accepted feet on the same game timestamp.
+        // Reject duplicate touchdown minima from the same planted foot or frame.
         unsigned minGlobalIntervalMs = 105u;
         if (motion_ == MotionState::Run)
             minGlobalIntervalMs = 82u;
@@ -2471,12 +4401,7 @@ private:
             return;
         }
 
-        // Continuous biped gait alternates feet. Bone sampling can report a
-        // second minimum from the same planted foot 250-350 ms later, which was
-        // still being accepted in the runtime log. Suppress same-foot repeats
-        // for a full stride window; after a longer gap we allow recovery so
-        // turns, animation changes, or a genuinely skipped touchdown cannot
-        // permanently desynchronise the detector.
+        // Require alternating feet within a stride; allow same-foot recovery after a long gap.
         if (acceptedStepSequenceInit_ &&
             lastAcceptedStepLeft_ == left &&
             lastAnyStepMs_ != 0 &&
@@ -2631,7 +4556,6 @@ private:
         }
 
         CPedIntelligence* intel = p->m_pIntelligence;
-        // Swimming and climbing end flights without a ground impact.
         if (intel && (intel->GetTaskSwim() || intel->GetTaskClimb())) {
             airborneInit_ = false;
             wasAirborne_ = false;
@@ -2645,9 +4569,7 @@ private:
         const float vz =
             p->m_vecMoveSpeed.z;
 
-        // Standing is collision evidence. The generic air flag alone can lag
-        // touchdown or miss ledge falls. Keep a confirmed flight latched until
-        // contact, including the zero-velocity frame at a jump's apex.
+        // Latch confirmed flight until ground contact; air flags can lag at touchdown/apex.
         const bool grounded = p->bIsStanding ||
             (p->bIsLanding && std::fabs(vz) < 0.015f);
         const bool airborne = !grounded &&
@@ -2769,9 +4691,7 @@ private:
 
         if (airborne && !wasAirborne_) {
             airborneStartedMs_ = now;
-            // Do not apply the ordinary "jump takeoff" impulse when the
-            // airborne transition is a vehicle bail. The dedicated bail-start
-            // response already represents the ejection.
+            // Skip jump impulse on bail-out; the ejection response already covers it.
             if (!vehicleBailActive_ && vz > 0.025f &&
                 !(intel && (intel->GetTaskJetPack() || intel->GetUsingParachute()))) {
                 impactSpring_.vertical.AddImpulse(
@@ -2809,8 +4729,7 @@ private:
                     1.4f
                 );
 
-            // GTA velocity units: ordinary jumps in the supplied log land at
-            // about 0.17. The old curve reduced them to only 0.15 severity.
+            // Typical logged jump impact speed ~0.17 (GTA units); avoid under-scaling.
             const float severity = Clamp(
                 std::sqrt(std::max(0.0f, (fall - 0.025f) / 0.32f)),
                 0.0f, 1.8f);
@@ -2842,8 +4761,7 @@ private:
                         3.0f
                     );
 
-                // A low vertical fall can still be a hard tumbling landing at
-                // high forward speed, so blend fall and exit-speed evidence.
+                // Blend fall speed with horizontal momentum to capture fast tumbles.
                 const float bailSeverity =
                     Clamp(
                         std::max(
@@ -2954,8 +4872,7 @@ private:
             mostNegativeAirVz_ = 0.0f;
         }
 
-        // Fail-safe: if a mod/script leaves bIsInTheAir inconsistent for a
-        // very long time, do not keep a stale bail classification forever.
+        // Expire stale bail state if scripts leave airborne flags inconsistent.
         if (vehicleBailActive_ &&
             now - vehicleBailStartedMs_ > 8000u) {
             vehicleBailActive_ = false;
@@ -2988,8 +4905,7 @@ private:
             lastConfirmedPlayerDamageMs_ = CTimer::m_snTimeInMilliseconds;
             const int weaponId = static_cast<int>(p->m_nLastWeaponDamage);
 
-            // GTA SA weapon families. Keep this numeric so the code remains
-            // compatible across plugin-sdk enum-header reorganisations.
+            // Use numeric GTA SA weapon families for plugin-sdk header compatibility.
             const bool meleeHit =
                 weaponId >= 0 && weaponId <= 15;
             const bool explosiveHit =
@@ -3027,16 +4943,12 @@ private:
             AddFovKick(cfg_.fovDamageKick *
                 Clamp(severity, 0.0f, 1.75f));
 
-            // Default fallback is a rearward/downward body reaction.
             float sideDir = RandomSigned() * 0.35f;
             float forwardDir = -1.0f;
             float verticalDir = meleeHit ? -0.34f : -0.20f;
             bool directional = false;
 
-            // Camera Response offsets are camera-local at commit time, so
-            // damage direction must also be computed in camera space. The old
-            // implementation used CJ's heading, which is wrong whenever the
-            // third-person camera is orbited around him.
+            // Damage impulse must be camera-local; player heading differs from an orbited camera.
             if (cfg_.directionalDamageEnabled && p->m_pLastEntityDamage) {
                 const CVector& pp = p->GetPosition();
                 const CVector& dp = p->m_pLastEntityDamage->GetPosition();
@@ -3088,9 +5000,8 @@ private:
                             right.y /= rLen;
                             right.z /= rLen;
 
-                            // Push the camera away from the attacker/projectile
-                            // source. Only use horizontal source direction here;
-                            // vertical shaping is handled independently below.
+                            // Push away from the source in the horizontal plane; vertical response is
+                            // separate.
                             sideDir =
                                 -Clamp(
                                     dx * right.x + dy * right.y,
@@ -3117,10 +5028,7 @@ private:
                     cfg_.directionalDamageWeight;
             }
 
-            // Family-specific physical shape:
-            // melee = heavier body displacement,
-            // bullets = sharper but shorter snap,
-            // explosives = strongest whole-body displacement.
+            // Melee: body shove; bullets: sharp snap; explosives: heavy displacement.
             float bodyImpulse = cfg_.damageImpulse * severity;
             float sideImpulse = cfg_.damageSideImpulse * severity;
 
@@ -3129,9 +5037,7 @@ private:
                 sideImpulse *= 1.18f;
                 verticalDir -= 0.08f;
             } else if (bulletHit) {
-                // Gunshots should read as an immediate sharp impact rather
-                // than a slow body shove. Keep the base spring smaller and
-                // add dedicated mid/high-band impulses below.
+                // Keep gunshot base spring small; mid/high-band impulses provide the snap.
                 bodyImpulse *= cfg_.incomingBulletRecovery;
                 sideImpulse *= cfg_.incomingBulletRecovery;
                 verticalDir = std::min(verticalDir, -0.12f);
@@ -3168,8 +5074,6 @@ private:
             }
 
             if (bulletHit && cfg_.frequencyBandsEnabled) {
-                // Mid-band punch gives a gunshot a short shoulder/chest hit
-                // before the slower body spring has time to move.
                 cr::CameraResponseEvent mid{};
                 mid.source = cr::ResponseSource::Combat;
                 mid.band = cr::ResponseBand::Mid;
@@ -3186,9 +5090,7 @@ private:
                 responseMixer_.Publish(mid);
             }
 
-            // Add a very short camera-local snap so small bullet/melee hits are
-            // perceptible immediately even while larger springs are already
-            // moving from gunfire, footsteps, or combat.
+            // Add immediate snap so hits remain visible atop existing spring motion.
             if (cfg_.frequencyBandsEnabled &&
                 cfg_.incomingDamageHighSnap > 0.0001f) {
                 const float snapAmount =
@@ -3262,7 +5164,6 @@ private:
             return;
         }
         lastNearbyGunfireScanMs_ = scanNow;
-        cr::ScopedScanProfile scanScope(scanProfiler_, cr::ScanKind::NearbyGunfire, cfg_.scanProfilingEnabled);
 
         auto* pool = CPools::ms_pPedPool;
         if (!pool)
@@ -3282,9 +5183,7 @@ private:
         unsigned frameShots = 0;
         unsigned responseShots = 0;
 
-        // Do not stop after an arbitrary number of NPC shots. Every detected
-        // firing event in the ped pool is processed. Final camera safety is
-        // still provided by the existing impact/final offset clamps.
+        // Track every NPC shot; final displacement clamps enforce safety.
         for (int i = 0; i < poolSize; ++i) {
             CPed* ped = pool->GetAt(i);
             NpcShotTrack& tr = npcShotTrack_[static_cast<size_t>(i)];
@@ -3328,15 +5227,10 @@ private:
             tr.nextShotMs = nextShot;
             tr.state = state;
 
-            // Primary signal: clip consumption tells us exactly how many ammo
-            // units were fired since the previous sample.
+            // Prefer consumed clip ammo to count shots.
             unsigned rounds = oldAmmo > newAmmo ? oldAmmo - newAmmo : 0u;
 
-            // Full-coverage fallback: some weapon/AI paths can keep clip ammo
-            // unchanged (or use unusual ammo semantics). A newly advanced shot
-            // cooldown while FIRING is still a real firing event. The state edge
-            // fallback catches short firing pulses even if the cooldown value is
-            // unchanged by the time gameProcessEvent samples it.
+            // Fallback to advancing cooldown or firing edge when ammo stays unchanged.
             const bool nextShotAdvanced =
                 nextShot != 0 &&
                 nextShot != oldNextShot &&
@@ -3349,8 +5243,7 @@ private:
             if (rounds == 0 && (nextShotAdvanced || firingEdge) && firingNow)
                 rounds = 1;
 
-            // Corrupt/modded ammo values must not generate hundreds of
-            // impulses in one gameProcessEvent sample.
+            // Clamp shot count from corrupt/modded ammo data.
             rounds = std::min(rounds, 8u);
 
             if (rounds == 0)
@@ -3395,12 +5288,8 @@ private:
                             aimTarget =
                                 useGun->m_pTarget->GetPosition();
 
-                            // The task target is an aim intention, not the
-                            // actual shot trajectory/spread. If the target is
-                            // CJ, this vector points exactly through CJ and
-                            // therefore cannot be used to prove a hit or a
-                            // near-miss (it produced lateral=0.000 for every
-                            // aimed shot in the runtime log).
+                            // Task target is aiming intent, not actual shot trajectory; aiming at CJ
+                            // proves neither hit nor miss.
                             if (taskTargetsPlayer)
                                 aimTarget.z += 0.70f;
 
@@ -3415,9 +5304,7 @@ private:
                     }
 
                     if (!haveAimTarget) {
-                        // Fallback only when no gun task target is available.
-                        // This preserves support for unusual scripted firing,
-                        // but normal AI fire now uses GTA's actual aim target.
+                        // Use scripted-fire fallback only when no gun-task target exists.
                         const float sf =
                             std::sin(ped->m_fHeadingCurrent);
                         const float cf =
@@ -3482,13 +5369,8 @@ private:
                         const unsigned nowMs =
                             CTimer::m_snTimeInMilliseconds;
 
-                        // GTA's health/armour sampling does not always expose
-                        // an NPC gunshot as a same-frame PLAYER DAMAGE event in
-                        // this plugin. The shot tracker already has enough
-                        // information to identify a round whose aim ray passes
-                        // through CJ's body corridor. Treat that as a hit-like
-                        // fallback, but suppress it when a real damage event was
-                        // just observed so confirmed damage never double-kicks.
+                        // When damage callbacks miss a shot, infer a hit-like event from CJ's aim
+                        // corridor; avoid double impulses.
                         const bool bulletWeapon =
                             (static_cast<int>(type) >= 22 &&
                              static_cast<int>(type) <= 34) ||
@@ -3550,9 +5432,8 @@ private:
 
                             tr.lastBodyHitMs = nowMs;
 
-                            // Shooter direction converted into camera-local
-                            // space so a hit from screen-right pushes left,
-                            // regardless of CJ's current world heading.
+                            // Convert attacker direction to camera-local space, independent of CJ's
+                            // heading.
                             CCam& activeCam =
                                 TheCamera.m_aCams[
                                     TheCamera.m_nActiveCam
@@ -4204,9 +6085,7 @@ private:
             ownVehicle ? 1.35f : 1.05f
         );
 
-        // A door slam is a short structural thump. Publish a compact mid-band
-        // layer as well so it cannot disappear behind other environmental
-        // contributors in a busy frame.
+        // Door slams also emit a short mid-band pulse to remain perceptible.
         if (cfg_.frequencyBandsEnabled) {
             cr::CameraResponseEvent doorEvent{};
             doorEvent.source = cr::ResponseSource::Environment;
@@ -4272,7 +6151,6 @@ private:
                 : std::max(float(cfg_.doorScanMs) * 0.001f, 0.001f);
 
         lastDoorScanMs_ = now;
-        cr::ScopedScanProfile scanScope(scanProfiler_, cr::ScanKind::Doors, cfg_.scanProfilingEnabled);
         const CVector& pp = player->GetPosition();
         const float maxD = std::max(
             cfg_.doorResponseMinDistance + 0.01f,
@@ -4387,9 +6265,8 @@ private:
                                 currentRatio - previous
                             );
 
-                        // CDoor::m_fAngVel is a better speed signal than a
-                        // 40 ms ratio delta, but retain the delta fallback for
-                        // scripted doors whose physics velocity is zeroed.
+                        // Prefer door angular velocity; use angle delta for scripted doors with zeroed
+                        // physics velocity.
                         const float closeSpeed =
                             std::max(
                                 angularSpeed[door],
@@ -4438,9 +6315,7 @@ private:
                                 componentScale *=
                                     cfg_.doorBootScale;
 
-                            // Use the actual door/component location rather
-                            // than vehicle centre so left/right door reactions
-                            // remain directional.
+                            // Use door location rather than vehicle center for left/right direction.
                             static const int kDoorNodes[6] = {
                                 CAR_BONNET,
                                 CAR_BOOT,
@@ -4633,9 +6508,7 @@ private:
                         continue;
                     }
 
-                    // Once GTA identifies an object as a door, keep that
-                    // classification latched. bIsDoorMoving is transient and
-                    // is commonly cleared before the final closed sample.
+                    // Latch door classification; bIsDoorMoving can clear before closure.
                     if (movingFlag || open)
                         tr.doorCandidate = true;
 
@@ -4832,8 +6705,7 @@ private:
                         vv.z * vv.z
                     );
 
-                // Prefer the faster retained motion source. GTA can update the
-                // player velocity one frame before/after clearing bInVehicle.
+                // Retain the faster velocity source across the bInVehicle transition.
                 const float playerSpeed =
                     std::sqrt(
                         exitVelocity.x * exitVelocity.x +
@@ -4915,8 +6787,7 @@ private:
                         player->m_vecMoveSpeed.z
                     );
 
-                // Many bail-outs are already airborne on the same frame GTA
-                // clears bInVehicle. Confirm immediately in that case.
+                // If already airborne when bInVehicle clears, confirm bailout immediately.
                 if (player->bIsInTheAir) {
                     vehicleBailActive_ = true;
                     vehicleBailCandidate_ = false;
@@ -5056,8 +6927,7 @@ private:
                     amp * 0.30f * directional;
             }
 
-            // Stroke cadence remains mostly vertical; travel direction now
-            // comes from the actual swim velocity above.
+            // Stroke gives vertical cadence; actual swim velocity gives direction.
             advancedPlayerSide_ +=
                 std::sin(t * 4.4f * 2.0f * kPi) *
                 amp * 0.16f;
@@ -5297,8 +7167,7 @@ private:
                 cfg_.jetpackVerticalScale *
                 directionalBase;
 
-            // Sustained flight retains a small directional body/load cue
-            // instead of reverting to anonymous vibration.
+            // Sustained flight keeps a directional load cue.
             targetSide +=
                 -localVelocitySide * 4.0f *
                 cfg_.jetpackVelocityInfluence *
@@ -5316,8 +7185,7 @@ private:
                 forwardDirectionScale *
                 directionalBase;
 
-            // Retain thrust/load while climbing or descending at constant
-            // speed; acceleration alone goes to zero in sustained flight.
+            // Include steady climb/descent thrust; acceleration alone vanishes at constant speed.
             targetVertical += -velocity.z * 4.0f *
                 cfg_.jetpackVelocityInfluence * cfg_.jetpackVerticalScale *
                 directionalBase;
@@ -5358,10 +7226,8 @@ private:
                 (targetForward - jetpackResponseForward_) *
                 smooth;
 
-            // Physical thrust is mixed separately from ambient effects.
 
-            // Tiny hover texture only. The previous full-time jetpack shake
-            // has intentionally been removed.
+            // Use minimal hover texture, not constant jetpack shake.
             const float speed =
                 std::sqrt(
                     velocity.x * velocity.x +
@@ -5506,8 +7372,7 @@ private:
                 2.5f
             );
 
-        // A real native shake should decay/change. A stale nonzero
-        // m_fCamShakeForce must not become an infinite procedural oscillator.
+        // Ignore stale native shake force; it must not drive perpetual oscillation.
         if (shake <= 0.001f) {
             if (nativeShakeBelowThresholdSinceMs_ == 0)
                 nativeShakeBelowThresholdSinceMs_ = now;
@@ -5546,8 +7411,7 @@ private:
             now - nativeShakeContinuousSinceMs_ >=
                 cfg_.nativeShakeMaxContinuousMs;
 
-        // Also treat a basically unchanged nonzero force as stale. This is
-        // the failure mode observed after explosion/combat camera shake.
+        // A nearly unchanged nonzero native shake force is also stale.
         const bool staleForce =
             cfg_.nativeShakeMaxContinuousMs > 0 &&
             nativeShakeLastChangedMs_ != 0 &&
@@ -5847,8 +7711,7 @@ private:
             windStrength *
             (0.70f + 0.30f * gustScale);
 
-        // Rain is deliberately subtle. It reads as fine body/camera texture
-        // and scales continuously with GTA's real rain blend.
+        // Scale subtle rain texture with GTA's actual rain blend.
         const float rainTexture =
             weatherRainBlend_ <= 0.0005f ? 0.0f :
             cfg_.proceduralNoiseEnabled
@@ -5885,8 +7748,7 @@ private:
             rainAmp *
             0.12f;
 
-        // Sandstorms are slower and heavier than rain and follow wind
-        // direction rather than producing unrelated camera oscillation.
+        // Sandstorm texture follows wind direction at a slower cadence than rain.
         const float sandTexture =
             weatherSandBlend_ <= 0.0005f ? 0.0f :
             cfg_.proceduralNoiseEnabled
@@ -6024,7 +7886,637 @@ private:
         }
     }
 
-#include "CameraResponseWorldScans.inc"
+    void UpdateLargeVehicleProximity(CPlayerPed* player) {
+        AuditHit(AUD_UpdateLargeVehicleProximity);
+        if (!cfg_.largeVehicleResponseEnabled || !player) {
+            largeVehicleSide_ = 0.0f;
+            largeVehicleVertical_ = 0.0f;
+            largeVehicleForward_ = 0.0f;
+            return;
+        }
+
+        const unsigned now = CTimer::m_snTimeInMilliseconds;
+        if (lastLargeVehicleScanMs_ != 0 &&
+            now - lastLargeVehicleScanMs_ < cfg_.largeVehicleScanMs) {
+            return;
+        }
+        lastLargeVehicleScanMs_ = now;
+
+        largeVehicleSide_ = 0.0f;
+        largeVehicleVertical_ = 0.0f;
+        largeVehicleForward_ = 0.0f;
+
+        auto* pool = CPools::ms_pVehiclePool;
+        if (!pool)
+            return;
+
+        const CVector& pp = player->GetPosition();
+        const float t = static_cast<float>(now) * 0.001f;
+        bool aircraftSeenThisScan = false;
+
+        for (int i = 0; i < pool->m_nSize; ++i) {
+            CVehicle* v = pool->GetAt(i);
+            if (!v || v->m_fHealth <= 0.0f)
+                continue;
+
+            const int model = v->m_nModelIndex;
+            const bool train = CModelInfo::IsTrainModel(model);
+            const bool heli = CModelInfo::IsHeliModel(model);
+            const bool plane = CModelInfo::IsPlaneModel(model);
+
+            if (!train && !heli && !plane)
+                continue;
+
+            if ((heli || plane) && !v->bEngineOn)
+                continue;
+
+            const CVector& vp = v->GetPosition();
+            const float dx = vp.x - pp.x;
+            const float dy = vp.y - pp.y;
+            const float dz = vp.z - pp.z;
+            const float distSq = dx * dx + dy * dy + dz * dz;
+
+            const float maxD =
+                train ? cfg_.trainResponseDistance : cfg_.aircraftResponseDistance;
+
+            if (distSq > maxD * maxD)
+                continue;
+
+            if (heli || plane) {
+                aircraftSeenThisScan = true;
+                aircraftLastSeenMs_ = now;
+
+                if (aircraftContinuousSinceMs_ == 0)
+                    aircraftContinuousSinceMs_ = now;
+
+                if (cfg_.aircraftMaxContinuousMs > 0 &&
+                    now - aircraftContinuousSinceMs_ >= cfg_.aircraftMaxContinuousMs) {
+                    if (!aircraftResponseSuppressed_ && cfg_.debug) {
+                        log_.Write(
+                            "AIRCRAFT RESPONSE SUPPRESSED continuousMs=%u model=%d heli=%d",
+                            now - aircraftContinuousSinceMs_,
+                            model,
+                            heli ? 1 : 0
+                        );
+                    }
+                    aircraftResponseSuppressed_ = true;
+                }
+
+                if (aircraftResponseSuppressed_)
+                    continue;
+            }
+
+            const float dist = std::sqrt(distSq);
+            const float falloff =
+                1.0f - Clamp(dist / std::max(maxD, 1.0f), 0.0f, 1.0f);
+
+            const float speed =
+                std::sqrt(
+                    v->m_vecMoveSpeed.x * v->m_vecMoveSpeed.x +
+                    v->m_vecMoveSpeed.y * v->m_vecMoveSpeed.y +
+                    v->m_vecMoveSpeed.z * v->m_vecMoveSpeed.z
+                );
+
+            const float distSafe=std::max(dist,0.001f);
+            const float radialVelocity=
+                (v->m_vecMoveSpeed.x*dx+
+                 v->m_vecMoveSpeed.y*dy+
+                 v->m_vecMoveSpeed.z*dz)/distSafe;
+            const float approach=
+                Clamp(-radialVelocity*3.0f,0.0f,1.0f);
+            const float tangentialSpeed=
+                std::sqrt(
+                    std::max(
+                        speed*speed-
+                        radialVelocity*radialVelocity,
+                        0.0f
+                    )
+                );
+            const float passActivity=
+                Clamp(tangentialSpeed*3.0f,0.0f,1.0f);
+            const float passageBoost=
+                1.0f+
+                approach*cfg_.nearbyApproachInfluence+
+                passActivity*cfg_.nearbyPassInfluence*0.55f;
+
+            float localSide = 0.0f;
+            float localForward = 0.0f;
+            WorldXYToCameraLocal(
+                dx,
+                dy,
+                localSide,
+                localForward
+            );
+            const float dirLen = std::max(
+                std::sqrt(
+                    localSide * localSide +
+                    localForward * localForward +
+                    dz * dz
+                ),
+                0.001f
+            );
+
+            const float sideBias =
+                cfg_.directionalResponseEnabled
+                    ? Clamp(-localSide / dirLen, -1.0f, 1.0f) *
+                      cfg_.directionalLargeVehicleScale
+                    : 0.0f;
+
+            const float forwardBias =
+                cfg_.directionalResponseEnabled
+                    ? Clamp(-localForward / dirLen, -1.0f, 1.0f) *
+                      cfg_.directionalLargeVehicleScale
+                    : 0.0f;
+
+            const float verticalBias =
+                cfg_.directionalResponseEnabled
+                    ? Clamp(-dz / dirLen, -1.0f, 1.0f) *
+                      cfg_.directionalLargeVehicleScale
+                    : 0.0f;
+
+            if (train) {
+                const float amp =
+                    (cfg_.trainResponseStrength * cfg_.presetAmbient) *
+                    falloff *
+                    Clamp(0.45f + speed * 4.0f, 0.45f, 1.35f) *
+                    passageBoost *
+                    cfg_.strength *
+                    cfg_.presetScale;
+
+                const float phase =
+                    t * (5.5f + speed * 6.0f) * 2.0f * kPi +
+                    static_cast<float>(i) * 0.41f;
+
+                largeVehicleSide_ +=
+                    (std::sin(phase * 0.73f) * 0.38f + sideBias * 0.62f) *
+                    amp;
+                largeVehicleVertical_ +=
+                    (std::sin(phase) * 0.82f + verticalBias * 0.18f) *
+                    amp;
+                largeVehicleForward_ +=
+                    (std::sin(phase * 0.57f + 1.0f) * 0.38f +
+                     forwardBias * 0.62f) *
+                    amp * 0.72f;
+            } else {
+                const float altitudeScale =
+                    Clamp(1.0f - std::fabs(dz) / std::max(maxD, 1.0f), 0.2f, 1.0f);
+                const float typeScale = heli ? 1.25f : 0.80f;
+                const float amp =
+                    (cfg_.aircraftResponseStrength * cfg_.presetAmbient) *
+                    typeScale *
+                    falloff *
+                    altitudeScale *
+                    passageBoost *
+                    cfg_.strength *
+                    cfg_.presetScale;
+
+                const float phase =
+                    t * (heli ? 11.5f : 7.2f) * 2.0f * kPi +
+                    static_cast<float>(i) * 0.73f;
+
+                largeVehicleSide_ +=
+                    (std::sin(phase * 0.81f) * 0.44f + sideBias * 0.56f) *
+                    amp;
+                largeVehicleVertical_ +=
+                    (std::sin(phase) * 0.56f +
+                     std::sin(phase * 1.87f) * 0.22f +
+                     verticalBias * 0.22f) *
+                    amp;
+                largeVehicleForward_ +=
+                    (std::sin(phase * 0.63f + 0.6f) * 0.42f +
+                     forwardBias * 0.58f) *
+                    amp * 0.68f;
+
+                if (heli && dz>0.0f && dz<=cfg_.rotorWashHeight) {
+                    const float horizontalDistance=std::sqrt(dx*dx+dy*dy);
+                    if (horizontalDistance<=cfg_.rotorWashDistance) {
+                        const float hFalloff=1.0f-Clamp(
+                            horizontalDistance/std::max(cfg_.rotorWashDistance,0.1f),
+                            0.0f,1.0f
+                        );
+                        const float zFalloff=1.0f-Clamp(
+                            dz/std::max(cfg_.rotorWashHeight,0.1f),
+                            0.0f,1.0f
+                        );
+                        const float wash=
+                            cfg_.rotorWashStrength*hFalloff*zFalloff*
+                            (0.55f+Clamp(speed*2.5f,0.0f,0.75f))*
+                            cfg_.strength*cfg_.presetScale;
+
+                        largeVehicleVertical_-=wash;
+                        largeVehicleSide_+=sideBias*wash*0.42f;
+                        largeVehicleForward_+=forwardBias*wash*0.28f;
+                    }
+                }
+            }
+        }
+
+        if (!aircraftSeenThisScan &&
+            aircraftContinuousSinceMs_ != 0 &&
+            aircraftLastSeenMs_ != 0 &&
+            now - aircraftLastSeenMs_ >= cfg_.aircraftRearmMs) {
+            if (aircraftResponseSuppressed_ && cfg_.debug)
+                log_.Write("AIRCRAFT RESPONSE REARMED");
+
+            aircraftContinuousSinceMs_ = 0;
+            aircraftLastSeenMs_ = 0;
+            aircraftResponseSuppressed_ = false;
+        }
+
+        const float largeVehicleEvidence =
+            std::fabs(largeVehicleSide_) +
+            std::fabs(largeVehicleVertical_) +
+            std::fabs(largeVehicleForward_);
+
+        if (largeVehicleEvidence > 0.00001f) {
+            TouchResponseSource(
+                cr::ResponseOrigin::Aircraft,
+                largeVehicleEvidence,
+                cfg_.aircraftRearmMs + 100u,
+                cfg_.aircraftMaxContinuousMs
+            );
+        }
+
+        const float cap = 0.085f;
+        largeVehicleSide_ = Clamp(largeVehicleSide_, -cap, cap);
+        largeVehicleVertical_ = Clamp(largeVehicleVertical_, -cap, cap);
+        largeVehicleForward_ = Clamp(largeVehicleForward_, -cap, cap);
+    }
+
+    void UpdateWorldObjectImpacts(CPlayerPed* player) {
+        AuditHit(AUD_UpdateWorldObjectImpacts);
+        if (!cfg_.worldObjectResponseEnabled || !player)
+            return;
+
+        const unsigned now = CTimer::m_snTimeInMilliseconds;
+        if (lastWorldObjectScanMs_ != 0 &&
+            now - lastWorldObjectScanMs_ < cfg_.worldObjectScanMs) {
+            return;
+        }
+        lastWorldObjectScanMs_ = now;
+
+        auto* pool = CPools::ms_pObjectPool;
+        if (!pool)
+            return;
+
+        if (worldObjectTrack_.size() != static_cast<size_t>(pool->m_nSize))
+            worldObjectTrack_.assign(static_cast<size_t>(pool->m_nSize), WorldObjectTrack{});
+
+        const CVector& pp = player->GetPosition();
+        const float maxD = std::max(cfg_.worldObjectImpactDistance, 1.0f);
+        const float maxDSq = maxD * maxD;
+
+        unsigned machineryContributors = 0;
+
+        for (int i = 0; i < pool->m_nSize; ++i) {
+            CObject* object = pool->GetAt(i);
+            WorldObjectTrack& tr =
+                worldObjectTrack_[static_cast<size_t>(i)];
+
+            if (!object) {
+                tr = {};
+                continue;
+            }
+
+            const CVector& op = object->GetPosition();
+            const float dx = op.x - pp.x;
+            const float dy = op.y - pp.y;
+            const float dz = op.z - pp.z;
+            const float distSq = dx * dx + dy * dy + dz * dz;
+
+            if (distSq > maxDSq) {
+                tr = {};
+                tr.object = object;
+                tr.collisionTime = object->m_nLastCollisionTime;
+                tr.velocity = object->m_vecMoveSpeed;
+                tr.damageIntensity = object->m_fDamageIntensity;
+                tr.initialized = true;
+                continue;
+            }
+
+            if (!tr.initialized || tr.object != object) {
+                tr = {};
+                tr.object = object;
+                tr.collisionTime = object->m_nLastCollisionTime;
+                tr.velocity = object->m_vecMoveSpeed;
+                tr.damageIntensity = object->m_fDamageIntensity;
+                tr.initialized = true;
+                continue;
+            }
+
+            const bool collisionEdge =
+                object->m_nLastCollisionTime != 0 &&
+                object->m_nLastCollisionTime != tr.collisionTime;
+
+            const float speed =
+                std::sqrt(
+                    object->m_vecMoveSpeed.x * object->m_vecMoveSpeed.x +
+                    object->m_vecMoveSpeed.y * object->m_vecMoveSpeed.y +
+                    object->m_vecMoveSpeed.z * object->m_vecMoveSpeed.z
+                );
+
+            const float dvx = object->m_vecMoveSpeed.x - tr.velocity.x;
+            const float dvy = object->m_vecMoveSpeed.y - tr.velocity.y;
+            const float dvz = object->m_vecMoveSpeed.z - tr.velocity.z;
+            const float deltaV = std::sqrt(dvx * dvx + dvy * dvy + dvz * dvz);
+
+            const float damageRise =
+                std::max(0.0f, object->m_fDamageIntensity - tr.damageIntensity);
+
+            // Collision timestamp changes during sustained contact; not every update is a new hit.
+            if (tr.contactActive &&
+                !collisionEdge &&
+                tr.lastCollisionObservedMs != 0 &&
+                now - tr.lastCollisionObservedMs >= cfg_.worldObjectContactReleaseMs) {
+                tr.contactActive = false;
+            }
+
+            const bool newContact =
+                collisionEdge &&
+                (!tr.contactActive ||
+                 tr.lastCollisionObservedMs == 0 ||
+                 now - tr.lastCollisionObservedMs >= cfg_.worldObjectContactReleaseMs);
+
+            if (collisionEdge) {
+                tr.lastCollisionObservedMs = now;
+                tr.contactActive = true;
+            }
+
+            const bool eventReady =
+                tr.lastImpactEventMs == 0 ||
+                now - tr.lastImpactEventMs >= cfg_.worldObjectImpactCooldownMs;
+
+            const bool strongReimpact =
+                collisionEdge &&
+                eventReady &&
+                (deltaV >= cfg_.worldObjectReimpactDeltaV ||
+                 damageRise >= cfg_.worldObjectReimpactDamageRise);
+
+            const bool meaningfulInitialContact =
+                newContact &&
+                (
+                    speed > 0.045f ||
+                    deltaV > 0.028f
+                );
+
+            if (eventReady &&
+                (meaningfulInitialContact || strongReimpact)) {
+                const float massScale =
+                    Clamp(
+                        std::sqrt(std::max(object->m_fMass, 1.0f) / 80.0f),
+                        0.65f,
+                        2.0f
+                    );
+
+                const float impactActivity =
+                    std::max(speed, deltaV * 1.35f);
+
+                const float strength =
+                    cfg_.worldObjectImpactStrength *
+                    massScale *
+                    Clamp(0.55f + impactActivity * 5.0f, 0.55f, 1.60f);
+
+                QueueSourceImpulse(
+                    player,
+                    op,
+                    strength,
+                    maxD,
+                    0.58f,
+                    1.0f,
+                    0.54f,
+                    1.20f
+                );
+
+                tr.lastImpactEventMs = now;
+
+                if (cfg_.debug) {
+                    log_.Write(
+                        "WORLD OBJECT IMPACT dist=%.2f speed=%.3f dv=%.3f "
+                        "mass=%.1f damage=%.2f damageRise=%.2f newContact=%d reimpact=%d",
+                        std::sqrt(distSq),
+                        speed,
+                        deltaV,
+                        object->m_fMass,
+                        object->m_fDamageIntensity,
+                        damageRise,
+                        meaningfulInitialContact ? 1 : 0,
+                        strongReimpact ? 1 : 0
+                    );
+                }
+            }
+
+            if (cfg_.advancedResponseEnabled &&
+                machineryContributors < 4 &&
+                !tr.contactActive &&
+                distSq <= cfg_.machineryDistance * cfg_.machineryDistance &&
+                object->m_fMass >= 180.0f &&
+                speed > 0.012f) {
+
+                const float machineryScale =
+                    (cfg_.machineryStrength * cfg_.presetAmbient) *
+                    Clamp(std::sqrt(object->m_fMass / 250.0f), 0.7f, 2.0f) *
+                    Clamp(speed * 5.0f, 0.15f, 1.25f) *
+                    cfg_.highFrequencyScale;
+
+                QueueSourceImpulse(
+                    player,
+                    op,
+                    machineryScale,
+                    cfg_.machineryDistance,
+                    0.34f,
+                    0.72f,
+                    0.42f,
+                    0.32f
+                );
+
+                ++machineryContributors;
+            }
+
+            tr.object = object;
+            tr.collisionTime = object->m_nLastCollisionTime;
+            tr.velocity = object->m_vecMoveSpeed;
+            tr.damageIntensity = object->m_fDamageIntensity;
+        }
+    }
+
+    void UpdatePedWorldResponses(CPlayerPed* player) {
+        AuditHit(AUD_UpdatePedWorldResponses);
+        if (!cfg_.pedWorldResponseEnabled || !player)
+            return;
+
+        const unsigned now = CTimer::m_snTimeInMilliseconds;
+        if (lastPedWorldScanMs_ != 0 &&
+            now - lastPedWorldScanMs_ < cfg_.pedWorldScanMs) {
+            return;
+        }
+        lastPedWorldScanMs_ = now;
+
+        auto* pool = CPools::ms_pPedPool;
+        if (!pool)
+            return;
+
+        if (pedWorldTrack_.size() != static_cast<size_t>(pool->m_nSize))
+            pedWorldTrack_.assign(static_cast<size_t>(pool->m_nSize), PedWorldTrack{});
+
+        const CVector& pp = player->GetPosition();
+        const float stepMaxD = std::max(cfg_.heavyFootstepDistance, 1.0f);
+        const float impactMaxD = 12.0f;
+
+        for (int i = 0; i < pool->m_nSize; ++i) {
+            CPed* ped = pool->GetAt(i);
+            PedWorldTrack& tr =
+                pedWorldTrack_[static_cast<size_t>(i)];
+
+            if (!ped || ped == player || ped->m_fHealth <= 0.0f) {
+                tr = {};
+                continue;
+            }
+
+            const CVector& pos = ped->GetPosition();
+            const float dx = pos.x - pp.x;
+            const float dy = pos.y - pp.y;
+            const float dz = pos.z - pp.z;
+            const float distSq = dx * dx + dy * dy + dz * dz;
+
+            if (!tr.initialized || tr.ped != ped) {
+                tr.ped = ped;
+                tr.collisionTime = ped->m_nLastCollisionTime;
+                tr.nextFootstepMs = now + 150u + (static_cast<unsigned>(i) * 37u % 220u);
+                tr.initialized = true;
+                continue;
+            }
+
+            const float speed =
+                std::sqrt(
+                    ped->m_vecMoveSpeed.x * ped->m_vecMoveSpeed.x +
+                    ped->m_vecMoveSpeed.y * ped->m_vecMoveSpeed.y
+                );
+
+            const bool collisionEdge =
+                ped->m_nLastCollisionTime != 0 &&
+                ped->m_nLastCollisionTime != tr.collisionTime;
+
+            if (collisionEdge &&
+                distSq <= impactMaxD * impactMaxD &&
+                (speed > 0.055f || ped->m_fDamageIntensity > 0.02f)) {
+
+                const float massScale =
+                    Clamp(std::sqrt(std::max(ped->m_fMass, 1.0f) / 70.0f), 0.8f, 1.35f);
+
+                QueueSourceImpulse(
+                    player,
+                    pos,
+                    cfg_.pedImpactStrength *
+                    massScale *
+                    Clamp(0.70f + speed * 3.0f, 0.70f, 1.45f),
+                    impactMaxD,
+                    0.60f,
+                    0.85f,
+                    0.55f,
+                    1.05f
+                );
+            }
+
+            // Approximate nearby runner footfalls without expensive NPC bone sampling.
+            if (distSq <= stepMaxD * stepMaxD &&
+                speed > 0.115f &&
+                !ped->bIsInTheAir &&
+                now >= tr.nextFootstepMs) {
+
+                const float dist = std::sqrt(distSq);
+                const float falloff =
+                    1.0f - Clamp(dist / stepMaxD, 0.0f, 1.0f);
+                const float massScale =
+                    Clamp(std::sqrt(std::max(ped->m_fMass, 1.0f) / 70.0f), 0.85f, 1.35f);
+                const float impulse =
+                    cfg_.heavyFootstepStrength *
+                    falloff *
+                    massScale *
+                    Clamp(speed / 0.20f, 0.65f, 1.35f);
+
+                QueueSourceImpulse(
+                    player,
+                    pos,
+                    impulse,
+                    stepMaxD,
+                    0.28f,
+                    1.0f,
+                    0.18f,
+                    0.45f
+                );
+
+                const unsigned interval =
+                    static_cast<unsigned>(
+                        Clamp(430.0f - speed * 900.0f, 230.0f, 430.0f)
+                    );
+                tr.nextFootstepMs = now + interval;
+            }
+
+            tr.ped = ped;
+            tr.collisionTime = ped->m_nLastCollisionTime;
+        }
+    }
+
+    void UpdateCameraObstructionResponse(
+        CPlayerPed* player,
+        CVehicle* vehicle,
+        float dt
+    ) {
+        AuditHit(AUD_UpdateCameraObstructionResponse);
+        if (!cfg_.obstructionResponseEnabled || !player) {
+            obstructionSpring_.Reset();
+            obstructionInit_ = false;
+            return;
+        }
+
+        CVector target =
+            vehicle ? vehicle->GetPosition() : player->GetPosition();
+        const CVector camera =
+            TheCamera.m_mCameraMatrix.pos;
+
+        const float dx = camera.x - target.x;
+        const float dy = camera.y - target.y;
+        const float dz = camera.z - target.z;
+        const float distance =
+            std::sqrt(dx * dx + dy * dy + dz * dz);
+
+        if (!obstructionInit_) {
+            previousCameraTargetDistance_ = distance;
+            obstructionInit_ = true;
+        } else {
+            const float delta =
+                distance - previousCameraTargetDistance_;
+
+            if (delta < -cfg_.obstructionThreshold) {
+                const float impulse =
+                    Clamp(
+                        (-delta - cfg_.obstructionThreshold) *
+                        cfg_.obstructionStrength,
+                        0.0f,
+                        0.65f
+                    );
+
+                // Counter abrupt stock obstruction motion; GTA retains line-of-sight control.
+                TouchResponseSource(
+                    cr::ResponseOrigin::Obstruction,
+                    impulse,
+                    700
+                );
+                obstructionSpring_.forward.AddImpulse(-impulse);
+            }
+
+            previousCameraTargetDistance_ = distance;
+        }
+
+        obstructionSpring_.Update(
+            dt,
+            cfg_.obstructionSpring,
+            (cfg_.obstructionDamping * cfg_.presetRecovery)
+        );
+
+        obstructionSpring_.forward.position =
+            Clamp(obstructionSpring_.forward.position, -0.12f, 0.08f);
+    }
 
     void UpdateNearbyVehicles(CPlayerPed* player, bool inVehicle, CVehicle* ownVehicle, float dt) {
         AuditHit(AUD_UpdateNearbyVehicles);
@@ -6057,7 +8549,6 @@ private:
                 : std::max(dt, 0.001f);
 
         lastNearbyVehicleScanMs_ = nowMs;
-        cr::ScopedScanProfile scanScope(scanProfiler_, cr::ScanKind::NearbyVehicles, cfg_.scanProfilingEnabled);
 
         nearbyVehicleSide_ = 0.0f;
         nearbyVehicleVertical_ = 0.0f;
@@ -6132,8 +8623,7 @@ private:
             distanceFalloff =
                 std::pow(distanceFalloff, std::max(0.05f, cfg_.nearbyVehiclesFalloffPower));
 
-            // GTA move-speed values are small. Treat ~0.02 as crawling/idle
-            // motion and ~0.55+ as fast road speed for this ambient layer.
+            // Ambient speed mapping: ~0.02 is near idle, ~0.55+ is fast traffic.
             const float lowSpeedNorm = Clamp(speed / 0.16f, 0.0f, 1.0f);
             const float highSpeedNorm = Clamp((speed - 0.16f) / 0.44f, 0.0f, 1.0f);
             float speedActivity =
@@ -6153,9 +8643,7 @@ private:
                 distanceFalloff *
                 activity;
 
-            // A deterministic per-pool-slot phase avoids nearby cars pulsing in
-            // sync. Faster vehicles vibrate a little faster; acceleration adds
-            // intensity, not an unbounded frequency jump.
+            // Per-pool-slot phase desynchronizes traffic; speed and acceleration shape vibration.
             const float rate = 5.5f + Clamp(speed * 8.0f, 0.0f, 6.0f);
             const float phase =
                 tNow * rate * 2.0f * kPi +
@@ -6385,7 +8873,7 @@ private:
         const float sh = std::sin(p->m_fHeadingCurrent);
         const float ch = std::cos(p->m_fHeadingCurrent);
 
-        // GTA heading basis: forward=(sin h, cos h), right=(cos h,-sin h).
+        // GTA heading: forward=(sin h, cos h), right=(cos h, -sin h).
         const float localForward = vx * sh + vy * ch;
         const float localSide = vx * ch - vy * sh;
 
@@ -6410,8 +8898,7 @@ private:
             leftFoot_.Reset();
             rightFoot_.Reset();
 
-            // Fade phase smoothly rather than instantly zeroing it, so
-            // run -> stop settles instead of snapping.
+            // Fade stride phase on stopping to avoid a camera snap.
             const float alpha =
                 1.0f - std::exp(-cfg_.footPhaseResponse * dt);
 
@@ -6434,13 +8921,11 @@ private:
         rightHeight_ = right.z - pelvis.z;
         footDiff_ = leftHeight_ - rightHeight_;
 
-        // Left/right foot separation is our real animation phase source.
+        // Foot separation drives animation phase.
         rawFootPhase_ =
             Clamp(footDiff_ * 2.7f, -1.0f, 1.0f);
 
-        // Important: the old translation-only build used the raw phase
-        // directly. Filter it every frame so locomotion glides between
-        // animation samples instead of looking like discrete offsets.
+        // Filter gait phase between animation samples to prevent stepped offsets.
         const float phaseAlpha =
             1.0f - std::exp(-cfg_.footPhaseResponse * dt);
 
@@ -6451,22 +8936,18 @@ private:
         const float phase =
             Clamp(smoothedFootPhase_, -1.0f, 1.0f);
 
-        // phase^2 gives two smooth vertical pulses per full left/right gait
-        // cycle and, unlike abs(phase), has no cusp at the center crossing.
+        // phase^2 creates two smooth vertical pulses per stride without an abs() cusp.
         const float stride =
             phase * phase;
 
-        // Center the vertical waveform around zero. The previous build spent
-        // most of locomotion at a nearly constant negative vertical offset,
-        // which technically moved the camera but did not read as "bob".
+        // Center the vertical bob around zero so it does not become a static downward offset.
         const float verticalWave =
             0.42f - stride;
 
         const float forwardWave =
             0.30f - stride;
 
-        // Actual horizontal speed adds continuous intensity while the move
-        // state selects walk/run/sprint scaling through strengthNow_.
+        // Speed shapes intensity; strengthNow_ selects the movement state.
         const float speed =
             HorizontalSpeed(p);
 
@@ -6517,9 +8998,7 @@ private:
             Step(false);
         }
 
-        // Low-level fallback motion remains underneath the real bone gait.
-        // It is deliberately small and only becomes stronger if touchdown
-        // detection has been quiet for a while.
+        // Small fallback gait grows only when bone touchdowns are absent.
         float freq = 6.4f;
         if (motion_ == MotionState::Run)
             freq = 9.3f;
@@ -6599,7 +9078,6 @@ private:
         if (!cfg_.inertiaEnabled)
             return;
 
-        // Camera-local inertial lag.
         lookTargetSide_ += Clamp(
             -yawRate_ * 0.0052f * cfg_.lookYaw,
             -0.040f,
@@ -6678,10 +9156,7 @@ private:
         const int weaponId = static_cast<int>(weaponType);
         const bool unarmed = weaponId <= 1; // fists / brass knuckles
 
-        // Normal combo slots are 0..2. GTA also uses additional fight slots
-        // for special/finisher attacks such as kicking a downed ped. The old
-        // classifier rejected every move outside 0..2, so those attacks never
-        // reached Camera Response at all.
+        // Accept GTA special/finisher fight slots beyond the normal 0..2 combo.
         const bool specialGroundLikeMove = move < 0 || move > 2;
 
         switch (style) {
@@ -6705,9 +9180,7 @@ private:
                 PlayerStrikeKind::Punch;
 
         default:
-            // Some unarmed special attacks use a transient/non-style combo
-            // selector. Keep them responsive when a real fight task + anim is
-            // active, while weapon fights still fall through to their own path.
+            // Accept special unarmed moves with live fight task+animation; preserve weapon fallback.
             if (unarmed && fight->m_pAnim)
                 return specialGroundLikeMove ?
                     PlayerStrikeKind::Kick :
@@ -6735,9 +9208,7 @@ private:
         const int move =
             Clamp(static_cast<int>(fight->m_nCurrentMove), 0, 2);
 
-        // GTA's fight task exposes three active move slots. Rather than giving
-        // every slot the same camera envelope, profile the stock combo steps:
-        // quick opener -> lateral/heavier follow-up -> strongest finisher.
+        // Profile combo stages: quick opener, weighted follow-up, strong finisher.
         static const float kMoveRelease[3] = { 0.86f, 1.03f, 1.18f };
         static const float kMoveSide[3]    = { 0.72f, 1.08f, 1.20f };
         static const float kMoveVertical[3]= { 0.82f, 1.00f, 1.18f };
@@ -6749,7 +9220,6 @@ private:
         phaseOffset = kMovePhase[move];
 
         if (style == STYLE_BOXING) {
-            // Boxing stays compact except for the final heavy/uppercut slot.
             sideScale *= move == 2 ? 0.92f : 0.78f;
             verticalScale *= move == 2 ? 1.28f : 0.72f;
         } else if (style == STYLE_KUNG_FU) {
@@ -6869,8 +9339,7 @@ private:
                 cfg_.kickSide :
                 cfg_.punchSide;
 
-            // Anticipation: the camera lags very slightly opposite the body
-            // drive before the strike is released.
+            // Anticipation briefly lags opposite the strike.
             impactSpring_.forward.AddImpulse(
                 windup * 0.42f * weaponProfileScale * (cfg_.combatResponseScale * cfg_.masterCombatScale * cfg_.presetCombat)
             );
@@ -6953,8 +9422,7 @@ private:
                 ((meleeAttackSerial_ + static_cast<unsigned>(move)) & 1u) ?
                 1.0f : -1.0f;
 
-            // Release is intentionally present even on a miss so the camera
-            // follows CJ's body mechanics, not just hit registration.
+            // Emit release even on misses to follow body motion.
             impactSpring_.forward.AddImpulse(-release);
             impactSpring_.vertical.AddImpulse(vertical * moveVerticalScale * weaponVerticalScale * comboScale * (specialGroundKick ? 1.35f : 1.0f) * weaponProfileScale * (cfg_.combatResponseScale * cfg_.masterCombatScale * cfg_.presetCombat));
             impactSpring_.side.AddImpulse(sign * side * moveSideScale * weaponSideScale * 0.72f * comboScale * weaponProfileScale * (cfg_.combatResponseScale * cfg_.masterCombatScale * cfg_.presetCombat));
@@ -6988,8 +9456,7 @@ private:
                 ((meleeAttackSerial_ + static_cast<unsigned>(move)) & 1u) ?
                 1.0f : -1.0f;
 
-            // Contact is a short secondary jolt layered on top of the body's
-            // release.  Kicks get more vertical weight; punches stay tighter.
+            // Layer a contact jolt over release; kicks bias vertical, punches stay compact.
             impactSpring_.forward.AddImpulse(-contact * 0.72f);
             impactSpring_.vertical.AddImpulse(
                 contact *
@@ -7064,10 +9531,8 @@ private:
                     fight->m_nCurrentMove
                 );
 
-                // GTA does not consistently expose MELEE_MADECONTACT for the
-                // chainsaw. The higher fight move slots observed during the
-                // sustained cutting sequence are used only while a live fight
-                // animation is present.
+                // Chainsaw contact is unreliable; require a live cutting animation for higher move
+                // slots.
                 sustainedCutHint = move >= 3;
             }
 
@@ -7126,11 +9591,8 @@ private:
                 ) *
                 amplitude;
 
-            // Do not integrate a one-way forward load into the shared impact
-            // spring every frame. That used to build a large negative spring
-            // displacement (often clamped at MaxFinalForward) and could remain
-            // visible long after the saw stopped. Keep it as a bounded,
-            // frame-local bias instead.
+            // Chainsaw forward load must be bounded and frame-local, never integrated into the shared
+            // spring.
             chainsawForwardBias_ =
                 -cfg_.chainsawForwardLoad *
                 (
@@ -7186,9 +9648,7 @@ private:
             return;
         }
 
-        // Leaving the chainsaw must immediately release all chainsaw-only
-        // state. In particular, never carry contact/activity blends or the
-        // frame-local forward bias into another weapon.
+        // Clear all chainsaw blends and forward bias on weapon exit.
         if (chainsawActivityBlend_ > 0.0f ||
             chainsawContactBlend_ > 0.0f ||
             chainsawForwardBias_ != 0.0f ||
@@ -7213,10 +9673,7 @@ private:
             chainsawNoise_.Reset(0x51A7B22Du);
         }
 
-        // GTA's CWeapon owns an FxSystem specifically for continuous
-        // flamethrower/spraycan/extinguisher effects. Represent those as a
-        // sustained texture while WEAPONSTATE_FIRING instead of discrete
-        // firearm recoil.
+        // Continuous-effect weapons use sustained texture while firing, not discrete gun recoil.
         if (id == 37 || id == 41 || id == 42) {
             const bool active =
                 weapon->m_nState == WEAPONSTATE_FIRING;
@@ -7315,15 +9772,9 @@ private:
         const eWeaponState weaponState =
             weapon->m_nState;
 
-        // Chainsaw is stateful/continuous. UpdateContinuousWeaponTexture()
-        // already handles idle/attack/cutting/contact. Treating its looping
-        // fight animation phase resets as discrete melee swings generated a
-        // stream of false START/RELEASE impulses and could sustain shake.
+        // Chainsaw animation loops are not new swings; its continuous texture handles cutting.
         if (id == 9) {
-            // Chainsaw remains continuous/stateful, but controller lock-on can
-            // suppress the fight-task transition GTA normally exposes. Give
-            // the initial fire edge a compact start jolt; sustained cutting
-            // remains owned by UpdateContinuousWeaponTexture().
+            // Controller lock-on can hide fight-task edges; emit one start pulse on fire edge.
             if (fireInputEdge) {
                 CPad* chainsawPad=p->GetPadFromPlayer();
                 const bool chainsawLockOn=(chainsawPad && chainsawPad->GetTarget()) || p->bIsAimingGun;
@@ -7392,7 +9843,6 @@ private:
 
         bool handledSwing = false;
 
-        // Preferred path: use GTA's live fight animation phase when present.
         if (haveFightAnim) {
             const float phase =
                 FightAnimationPhase(fight);
@@ -7496,11 +9946,7 @@ private:
             lastWeaponFightPhase_ = phase;
         }
 
-        // Fallback path:
-        // Some GTA melee weapons, especially the police nightstick/baton, can
-        // advance weapon firing/cooldown state without exposing a usable
-        // CTaskSimpleFight animation through GetTaskFighting(). Detect the
-        // actual weapon cycle instead of silently returning false.
+        // Melee fallback uses weapon cooldown when fight animation is unavailable (e.g. nightstick).
         const bool firingEdge =
             weaponState == WEAPONSTATE_FIRING &&
             lastMeleeWeaponState_ != WEAPONSTATE_FIRING;
@@ -7529,9 +9975,7 @@ private:
                     ? 1.0f
                     : -1.0f;
 
-            // A compact anticipation + release combined response. This path
-            // intentionally does not wait for contact, so missed baton/bat
-            // swings still move the camera naturally.
+            // Fallback swing includes anticipation/release even without registered contact.
             impactSpring_.forward.AddImpulse(
                 -releaseForward *
                 0.92f *
@@ -7744,17 +10188,12 @@ private:
             return;
         }
 
-        // PRIMARY signal:
-        // A clip decrease is a real ammo-consuming shot. Do NOT require the
-        // weapon to still be WEAPONSTATE_FIRING here: gameProcessEvent runs
-        // after gameplay processing and short-lived firing states can already
-        // have changed by the time this sampler sees the weapon.
+        // Clip loss signals shots even if gameProcessEvent samples after FIRING has ended.
         const unsigned clipSpent =
             prevAmmo_ > clip ?
             prevAmmo_ - clip :
             0u;
-        // Some flight/weapon paths consume reserve ammo while restoring the
-        // clip. Clip and total represent the same shots, so use max, not sum.
+        // Clip and total ammo may reflect the same shot; use max, not sum.
         const unsigned totalSpent = jetpackTask && prevAmmoTotal_ > total
             ? prevAmmoTotal_ - total : 0u;
         const unsigned roundsSpent = std::max(clipSpent, totalSpent);
@@ -7762,10 +10201,7 @@ private:
         const bool ammoShot =
             roundsSpent > 0;
 
-        // FALLBACK signal:
-        // m_nTimeForNextShot is a timestamp in current plugin-sdk's CWeapon.
-        // It advances when a new shot schedules its cooldown. This catches
-        // infinite-ammo cheats and weapon paths where the clip is unchanged.
+        // Fallback to m_nTimeForNextShot changes for infinite-ammo/unchanged-clip weapons.
         const bool nextShotAdvanced =
             nextShot != 0 &&
             nextShot != prevNextShotMs_ &&
@@ -7774,8 +10210,6 @@ private:
         const bool firingState =
             state == WEAPONSTATE_FIRING;
 
-        // CPad's reconciled ButtonCircle is the normal ped fire action,
-        // including keyboard/mouse/controller input after GTA input mapping.
         const bool timingShot =
             !ammoShot &&
             nextShotAdvanced &&
@@ -7871,8 +10305,7 @@ private:
         if (!v)
             return cfg_.vehicleOtherScale;
 
-        // CVehicle::GetVehicleAppearance() is part of SA's stock vehicle API:
-        // 1 automobile, 2 bike, 3 heli, 4 boat, 5 plane.
+        // Vehicle appearance IDs: auto=1, bike=2, heli=3, boat=4, plane=5.
         switch (v->GetVehicleAppearance()) {
         case 1: return cfg_.vehicleAutomobileScale;
         case 2: return cfg_.vehicleBikeScale;
@@ -8002,11 +10435,9 @@ private:
     }
 
     void InstallWaterCannonHook() {
-        // Verified in the supplied US 1.0 EXE: FireTruckControl submits an
-        // actual spray segment here (also used by the SWAT water cannon).
+        // US 1.0 FireTruckControl submits the water-spray segment; SWAT uses it too.
         constexpr uintptr_t site = 0x72A260;
-        if (!cr::ClassicSaImageLayout() ||
-            !cr::ReadableImageCode(0x728CB0, 5) ||
+        if (!IsReadableCodeSpan(site, 5) ||
             DecodeRelativeCallTarget(site) != 0x728CB0) {
             log_.Write("WATER CANNON hook skipped: emission callsite differs from stock");
             return;
@@ -8047,8 +10478,7 @@ private:
         if (gun || minigun || missile) {
             float side = 0.0f, forward = -1.0f;
             if (tank) {
-                // SDK names this vertical, but offset 0x94C is turret yaw in
-                // the executable. Preserve recoil opposite the actual barrel.
+                // SDK labels offset 0x94C vertical; EXE uses it as turret yaw.
                 const float yaw = reinterpret_cast<CAutomobile*>(v)->m_fDoomVerticalRotation;
                 side = std::sin(yaw);
                 forward = -std::cos(yaw);
@@ -8056,8 +10486,7 @@ private:
             float cameraSide = 0.0f, cameraForward = 0.0f;
             VehicleLocalXYToCameraLocal(v, side, forward, cameraSide, cameraForward);
             const float kick = (heavy ? cfg_.mountedHeavyStrength : cfg_.mountedGunStrength) * gain;
-            // Immediate displacement remains visible at high FPS and with
-            // optional rotation off; existing impact bounds limit the tail.
+            // Immediate displacement stays visible at high FPS and when rotation is off.
             impactSpring_.side.position = Clamp(impactSpring_.side.position + cameraSide*kick, -cfg_.maxImpactOffset, cfg_.maxImpactOffset);
             impactSpring_.forward.position = Clamp(impactSpring_.forward.position + cameraForward*kick, -cfg_.maxImpactOffset, cfg_.maxImpactOffset);
             impactSpring_.vertical.position = Clamp(impactSpring_.vertical.position + kick*0.45f, -cfg_.maxImpactOffset, cfg_.maxImpactOffset);
@@ -8079,8 +10508,7 @@ private:
             const float amp = cfg_.mountedWaterStrength * gain * waterResponseBlend_;
             const float pulse = 1.0f + 0.22f*std::sin(float(now)*0.055f);
             if (length > 0.001f) {
-                // Feed a bounded camera-local pressure offset to the common
-                // spring target-free mix, independently of ambient ducking.
+                // Mix bounded camera-local pressure separately from ambient ducking.
                 mountedWaterSide_ = -side/length*amp*pulse;
                 mountedWaterForward_ = -forward/length*amp*pulse;
                 mountedWaterVertical_ = -waterEmissionVelocity_.z/length*amp*pulse + amp*0.15f*std::sin(float(now)*0.081f);
@@ -8093,8 +10521,7 @@ private:
 
     void UpdateVehicle(CVehicle* v, float dt) {
         AuditHit(AUD_UpdateVehicle);
-        // Clear the frame mix before any producer writes to it (including
-        // RPM vibration and the gear pulse below).
+        // Reset frame mix before RPM, gearshift, or other producers add to it.
         advancedVehicleSide_ = 0.0f;
         advancedVehicleVertical_ = 0.0f;
         advancedVehicleForward_ = 0.0f;
@@ -8194,8 +10621,7 @@ private:
         const float localForward =
             accel.x * forward.x + accel.y * forward.y;
 
-        // Filter physics spikes before they become camera targets. True hard
-        // impacts are handled separately below as impulses.
+        // Filter physics spikes from steady camera targets; impacts have separate impulses.
         vehicleSideAccel_ = Clamp(localSide, -5.0f, 5.0f);
         vehicleForwardAccel_ = Clamp(localForward, -6.0f, 6.0f);
         vehicleVerticalAccelNow_ = Clamp(accel.z, -7.0f, 7.0f);
@@ -8302,9 +10728,7 @@ private:
         advancedVehicleForward_ += vehicleGearPulse_;
         advancedVehicleVertical_ -= std::fabs(vehicleGearPulse_)*0.18f;
 
-        // Per-vehicle suspension personality comes from GTA SA's live
-        // tHandlingData. Values are normalized and clamped so vanilla and
-        // custom handling.cfg setups can influence the camera safely.
+        // Normalize live tHandlingData to support stock and custom vehicle suspension.
         vehicleSuspensionHandlingStiffness_ = 1.0f;
         vehicleSuspensionHandlingDamping_ = 1.0f;
         vehicleSuspensionHandlingTravel_ = 1.0f;
@@ -8328,8 +10752,7 @@ private:
             const float rawBias = Clamp(h->m_fSuspensionBiasBetweenFrontAndRear, 0.0f, 1.0f);
             const float rawAntiDive = Clamp(h->m_fSuspensionAntiDiveMultiplier, 0.0f, 2.0f);
 
-            // Ratios are centered around common SA road-car values, then
-            // clamped to keep unusual/modded handling data camera-safe.
+            // Clamp ratios around typical road-car handling values for mod safety.
             vehicleSuspensionHandlingMass_ =
                 Clamp(std::sqrt(rawMass / 1400.0f), 0.70f, 1.45f);
             vehicleSuspensionHandlingStiffness_ =
@@ -8382,8 +10805,7 @@ private:
                 1.0f + (adaptiveImpulse - 1.0f) * influence;
         }
 
-        // Acceleration pulls the camera rearward; braking lets it surge
-        // forward. Cornering leans it opposite lateral acceleration/turn.
+        // Acceleration pulls back, braking surges forward, cornering leans outward.
         float forwardWeight =
             vehicleForwardAccel_ >= 0.0f
                 ? cfg_.vehicleAccelForward
@@ -8396,9 +10818,7 @@ private:
             forwardWeight *= (1.0f - antiDiveReduction);
         }
 
-        // Camera-only inertial lag. These targets never write vehicle physics
-        // or handling state; they model what the occupant/camera feels during
-        // throttle, braking, cornering and heave.
+        // Inertial targets affect the camera only, never vehicle physics or handling.
         vehicleTargetForward_ =
             Clamp(-vehicleForwardAccel_ * 0.040f * forwardWeight * master,
                   -cfg_.vehicleMaxForward, cfg_.vehicleMaxForward);
@@ -8494,10 +10914,7 @@ private:
         const float physicalDamageIntensity =
             std::max(0.0f, v->m_fDamageIntensity);
 
-        // m_vecLastCollisionImpactVelocity is not an impact-strength vector.
-        // GTA fills it from the collision normal scaled by a distance factor,
-        // so its magnitude is often near 1.0 even during ordinary contacts.
-        // It must therefore NOT be used to scale camera severity.
+        // m_vecLastCollisionImpactVelocity encodes collision normal/distance, not impact severity.
         const bool contactMetadata =
             newEntityContact ||
             physicalDamageIntensity > 0.01f ||
@@ -8509,18 +10926,11 @@ private:
         const float strongDv =
             std::max(cfg_.vehicleContactStrongDeltaVelocity, dvThreshold * 1.5f);
 
-        // A real collision produces a discontinuity in vehicle velocity.
-        // Normal road/ground contact can update GTA's collision timestamp every
-        // frame, but it does not normally produce a sufficiently large delta-V.
+        // Use velocity discontinuity; persistent road contact can repeatedly update collision time.
         const bool deltaVelocityImpact =
             deltaVelMag >= dvThreshold;
 
-        // Delta-V by itself is not reliable collision evidence. Steering,
-        // braking and rough-road suspension produced several false CONTACT-HIT
-        // events in the runtime log with no entity, no damage entity, no wall
-        // flag and zero damage intensity. Require GTA collision metadata or a
-        // fresh collision timestamp before a velocity discontinuity can become
-        // a camera impact.
+        // Require collision metadata/timestamp plus delta-V to reject steering/braking false hits.
         const bool collisionEvidence =
             contactMetadata ||
             freshCollisionTimestamp;
@@ -8529,11 +10939,8 @@ private:
             freshCollisionTimestamp &&
             deltaVelMag >= strongDv * 1.35f;
 
-        // Hysteresis: trigger on the rising edge, or allow a distinctly stronger
-        // second impact after the cooldown, but only with collision evidence.
-        // The cooldown is intentionally longer than a single physics-contact
-        // burst so one crash touching multiple entities does not become two or
-        // three separate camera kicks.
+        // Collision hysteresis merges one crash's multiple contacts; retrigger only for stronger
+        // impacts.
         const bool risingImpact =
             deltaVelocityImpact &&
             prevVehicleDeltaVelMag_ < dvThreshold * 0.70f;
@@ -8569,8 +10976,6 @@ private:
                     0.08f, 2.0f
                 );
 
-            // Direction comes from actual velocity discontinuity, which is what
-            // the player's body/camera physically reacts to.
             const float dirDenom =
                 std::max(
                     std::fabs(localDeltaSide) +
@@ -8619,8 +11024,7 @@ private:
                 sequenceScale *
                 master;
 
-            // Dedicated transient spring: collision response cannot be hidden by
-            // sustained cornering/acceleration saturating the normal vehicle spring.
+            // Separate collision spring prevents normal driving motion from masking crashes.
             vehicleCollisionSpring_.side.AddImpulse(
                 sideDir *
                 contactImpulse *
@@ -8644,9 +11048,7 @@ private:
                 cfg_.vehicleCrashVerticalMultiplier
             );
 
-            // Direct kick is deliberately independent from the normal vehicle
-            // spring. This makes the first 50-150 ms of a real collision visible
-            // even if acceleration/cornering offsets are already near their clamp.
+            // Independent immediate collision kick remains visible during saturated cornering offsets.
             const float kickMagnitude =
                 Clamp(
                     cfg_.vehicleContactDirectKick *
@@ -8669,9 +11071,7 @@ private:
             vehicleCollisionKickForward_ =
                 Clamp(vehicleCollisionKickForward_, -0.18f, 0.18f);
 
-            // Immediate displacement gives the hit a readable first-frame punch.
-            // Unlike the previous implementation this uses its own spring, so it
-            // is not clipped by normal cornering weight transfer.
+            // Separate first-frame collision displacement from normal cornering springs.
             const float immediate =
                 Clamp(
                     0.018f + severity * 0.032f,
@@ -8692,8 +11092,6 @@ private:
             AddFovKick(cfg_.fovVehicleImpactKick *
                 Clamp(severity, 0.0f, 2.0f));
 
-            // Existing damage-crash reinforcement can now use the same real
-            // collision window.
             lastVehicleImpactMs_ = now;
 
             if (cfg_.debug) {
@@ -8764,10 +11162,7 @@ private:
                 );
         }
 
-        // Reinforce a real collision when GTA actually subtracts vehicle
-        // health. Health loss alone is intentionally insufficient: the
-        // velocity-change/physics window must also indicate a crash, so weapon
-        // or fire damage does not shake the camera like a wall impact.
+        // Reinforce health loss only within a real collision window; exclude fire/weapon damage.
         const float currentHealth = v->m_fHealth;
         if (!vehicleHealthInit_) {
             vehicleHealthInit_ = true;
@@ -8779,8 +11174,7 @@ private:
 
         const bool recentPhysicsImpact =
             (now - lastVehicleImpactMs_) <= cfg_.vehicleCrashPhysicsWindowMs;
-        // A per-frame velocity delta catches damaging crashes that land just
-        // below the acceleration threshold at low/variable frame rates.
+        // Frame delta-V catches crashes below smoothed acceleration thresholds.
         const bool collisionMotion =
             recentPhysicsImpact ||
             deltaVelMag >= 0.055f ||
@@ -8801,10 +11195,8 @@ private:
             const float catastropheScale =
                 catastrophic ? cfg_.vehicleCrashCatastrophicMultiplier : 1.0f;
 
-            // Convert the collision velocity delta to a stable vehicle-local
-            // direction. A frontal collision normally causes negative local
-            // forward delta (rapid deceleration), producing a positive
-            // forward camera surge.
+            // Project collision delta-V into vehicle space; frontal deceleration surges the camera
+            // forward.
             const float dirDenom =
                 std::max(std::fabs(localDeltaSide) +
                          std::fabs(localDeltaForward) +
@@ -8817,8 +11209,7 @@ private:
             const float verticalDir =
                 Clamp(-localDeltaVertical / dirDenom, -1.0f, 1.0f);
 
-            // Front vs rear weighting is based on collision response:
-            // positive forwardDir = strong deceleration/front hit.
+            // Positive forwardDir indicates a frontal/deceleration hit.
             const float longitudinalMultiplier =
                 forwardDir >= 0.0f
                     ? cfg_.vehicleCrashFrontMultiplier
@@ -8837,8 +11228,7 @@ private:
                 forwardDir * damageImpulse * longitudinalMultiplier
             );
 
-            // Give severe crashes a short downward chassis/body compression
-            // even when the collision itself is nearly horizontal.
+            // Strong crashes add short downward chassis compression.
             const float verticalKick =
                 verticalDir * damageImpulse * cfg_.vehicleCrashVerticalMultiplier -
                 damageImpulse * (0.08f + 0.10f * Clamp(damageSeverity, 0.0f, 1.0f));
@@ -8871,10 +11261,7 @@ private:
             }
         }
 
-        // Automobile suspension reinforcement. Per-wheel compression is
-        // weighted by the handling front/rear suspension bias, then translated
-        // through a dedicated spring whose stiffness/damping/impulse character
-        // is derived from this vehicle's live handling data.
+        // Weight wheel compression by live handling and feed a dedicated suspension spring.
         vehicleSuspensionJolt_ = 0.0f;
         if (cfg_.vehicleSuspensionEnabled &&
             v->GetVehicleAppearance() == VEHICLE_APPEARANCE_AUTOMOBILE) {
@@ -8896,7 +11283,7 @@ private:
                     Clamp(car->m_fWheelsSuspensionCompressionPrev[wheel], 0.0f, 1.5f);
                 const float d = previous - current; // positive = rapid compression
 
-                // GTA SA eWheels order is FL, RL, FR, RR.
+                // GTA eWheels order: FL, RL, FR, RR.
                 const bool frontWheel = (wheel == 0 || wheel == 2);
                 const float axleWeight = frontWheel ? frontWeight : rearWeight;
 
@@ -8912,9 +11299,7 @@ private:
             vehicleSuspensionJolt_ =
                 std::max(compressionDelta, strongestCompression * 0.50f);
 
-            // Stiff/short-travel setups generally move less physically, so
-            // lower the trigger slightly; long/soft suspension naturally
-            // produces larger compression deltas and can keep the base gate.
+            // Reduce compression trigger for stiff/short-travel setups; preserve soft-travel behavior.
             float adaptiveThreshold = cfg_.vehicleSuspensionThreshold;
             if (cfg_.vehicleSuspensionAdaptiveHandling) {
                 const float thresholdScale =
@@ -8945,8 +11330,7 @@ private:
 
                 vehicleSuspensionSpring_.vertical.AddImpulse(-suspensionImpulse);
 
-                // A small fore/aft component helps front/rear curb strikes
-                // read as chassis movement without requiring camera rotation.
+                // Fore/aft curb response works even with camera rotation disabled.
                 vehicleSuspensionSpring_.forward.AddImpulse(
                     Clamp(-localDeltaForward * 0.40f, -0.18f, 0.18f) *
                     suspensionImpulse
@@ -9210,8 +11594,7 @@ private:
                     master;
 
                 if (bmx) {
-                    // Phase-lock the camera to GTA's actual BMX crank instead
-                    // of synthesizing cadence from speed and elapsed time.
+                    // Derive BMX cadence from actual crank motion rather than speed/time.
                     CBmx* bicycle =
                         reinterpret_cast<CBmx*>(v);
 
@@ -9220,9 +11603,7 @@ private:
                     const float rightAngle =
                         bicycle->m_fPedalAngleR;
 
-                    // Left and right pedals are nominally opposite. Combining
-                    // left with the inverted right vector gives a stable crank
-                    // phase while averaging out small per-pedal differences.
+                    // Combine left pedal and inverted right pedal vectors to stabilize crank phase.
                     const float phaseX =
                         std::cos(leftAngle) -
                         std::cos(rightAngle);
@@ -9264,8 +11645,7 @@ private:
 
                         previousBmxPedalAngle_ = pedalPhase;
 
-                        // No crank motion means no pedal camera motion, even
-                        // if the BMX is still moving while CJ coasts.
+                        // No crank movement means no pedaling bob, even while coasting.
                         const float cadence =
                             Clamp(
                                 bmxPedalRateSmoothed_ / 10.0f,
@@ -9280,15 +11660,13 @@ private:
                                 cfg_.highFrequencyScale *
                                 master;
 
-                            // Two load pulses per crank revolution: one for
-                            // each left/right downstroke.
+                            // Two load pulses per crank revolution, one per downstroke.
                             const float downstroke =
                                 -std::cos(
                                     pedalPhase * 2.0f
                                 );
 
-                            // Lateral weight shift follows the true crank once
-                            // per revolution.
+                            // Lateral weight shift follows the crank once per revolution.
                             const float bodyShift =
                                 std::sin(pedalPhase);
 
@@ -9319,9 +11697,7 @@ private:
                     (v->m_nVehicleSubClass == VEHICLE_BOAT &&
                      reinterpret_cast<CBoat*>(v)->m_nBoatFlags.bOnWater);
 
-                // GTA's boat physics already contains the real water-wave
-                // solution. Read hull heave/roll/pitch from that physical
-                // motion instead of synthesizing an unrelated camera sine.
+                // Use physical hull wave motion for heave/roll/pitch, not synthetic oscillation.
                 const float boatRoll =
                     Clamp(vm.right.z, -0.95f, 0.95f);
 
@@ -9361,9 +11737,8 @@ private:
                     );
 
                 const float waveMaster =
-                    // BoatWaveStrength historically defaults to 0.085. Treat
-                    // that as the nominal gain: the per-axis scales already
-                    // specify small camera displacements.
+                    // BoatWaveStrength=0.085 is nominal; axis coefficients already define small
+                    // offsets.
                     (cfg_.boatWaveStrength / 0.085f) *
                     cfg_.presetAmbient *
                     master *
@@ -9440,9 +11815,7 @@ private:
                 advancedVehicleForward_ +=
                     boatWaveForward_;
 
-                // Optional orientation response uses actual hull attitude and
-                // rate, producing slow wave-following pitch/roll rather than
-                // noisy camera rotation.
+                // Optional orientation follows hull attitude/rate for smooth wave roll and pitch.
                 boatWavePitchDeg_ =
                     Clamp(
                         (-boatPitch * 0.58f -
@@ -9463,8 +11836,7 @@ private:
                         cfg_.boatWaveRotationRollDeg
                     );
 
-                // Re-entry into water arrests downward motion: hull
-                // acceleration is upward, while the camera kick is downward.
+                // Water re-entry creates upward hull acceleration and downward camera kick.
                 const float slamAccel =
                     std::max(
                         0.0f,
@@ -9645,9 +12017,7 @@ private:
                     (-aircraftPitch - Clamp(pitchRate, -3.0f, 3.0f) * 0.45f) *
                     cfg_.aircraftAttitudeHold;
 
-                // Pitch/roll rates must also reach translation when optional
-                // camera rotation is off. Scale physical response once, just
-                // like the turbulence and engine contributions below.
+                // Pitch/roll rate must also affect translation when orientation is disabled.
                 targetSide *= master;
                 targetVertical *= master;
                 targetForward *= master;
@@ -9712,8 +12082,6 @@ private:
                     turbulenceAmp *
                     (helicopter ? 0.38f : 0.48f);
 
-                // Rotor/airframe texture is intentionally tiny and only
-                // supplements physical motion.
                 const float engineTexture =
                     helicopter
                         ? cfg_.aircraftHeliRotorVibration
@@ -10118,8 +12486,7 @@ private:
             vehiclePersonalityResponse_ *
             (cfg_.vehicleResponseScale * cfg_.masterVehicleScale * cfg_.presetVehicle);
 
-        // Speed texture is intentionally tiny: it should read as road/engine
-        // energy rather than a sine-wave bob. Bikes receive more via profile.
+        // Keep road/engine texture small; bikes gain more through their profile.
         const float speedNorm = Clamp(vehicleSpeed_ / 0.75f, 0.0f, 1.0f);
         const float vibration =
             (cfg_.vehicleSpeedVibration * cfg_.presetAmbient) *
@@ -10144,10 +12511,7 @@ private:
             vehicleVibrationForward_ = 0.0f;
         }
 
-        // Horn vibration is deliberately independent from speed so a parked
-        // car still gives a faint body/chassis buzz while the horn is sounding.
-        // Smooth attack/release prevents a hard camera discontinuity when the
-        // horn key is pressed or released.
+        // Horn vibration works at idle; ease attack/release to avoid discontinuities.
         vehicleHornActive_ =
             cfg_.vehicleHornEnabled && v->m_nHornCounter != 0;
 
@@ -10182,12 +12546,7 @@ private:
             vehicleHornForward_ = 0.0f;
         }
 
-        // Own-vehicle response is generated in VEHICLE-local space
-        // (right/forward). It must be converted to CAMERA-local space before
-        // being mixed with nearby/world/weather/camera effects. The previous
-        // code mixed these spaces directly, which made orbiting the camera
-        // visually drag/pitch the vehicle body even though no vehicle physics
-        // state was actually modified.
+        // Convert own-vehicle motion from vehicle-local to camera-local before mixing world effects.
         const float ownVehicleSide =
             vehicleSpring_.side.position +
             vehicleSuspensionSpring_.side.position +
@@ -10244,12 +12603,11 @@ private:
         vertical += mountedWaterVertical_;
         forward += mountedWaterForward_;
 
-        // Player weapon recoil remains visible in supported third-person
+        // Keep player recoil in third-person vehicle view.
         side += recoilSpring_.side.position * cfg_.strength * cfg_.presetScale;
         vertical += recoilSpring_.vertical.position * cfg_.strength * cfg_.presetScale;
         forward += recoilSpring_.forward.position * cfg_.strength * cfg_.presetScale;
 
-        // Nearby blasts/damage/NPC gunfire/melee use the common impact spring.
         side += impactSpring_.side.position * cfg_.strength * cfg_.presetScale;
         vertical += impactSpring_.vertical.position * cfg_.strength * cfg_.presetScale;
         forward += impactSpring_.forward.position * cfg_.strength * cfg_.presetScale;
@@ -10515,8 +12873,7 @@ private:
             log_.Write("STABILITY WATCHDOG reset impact/mixer due to non-finite or runaway transient state");
         }
 
-        // Snap microscopic residuals to zero. This is below visible motion and
-        // prevents denormal-sized spring tails from surviving indefinitely.
+        // Zero invisible residuals to avoid denormal spring tails.
         auto settle = [](Spring1D& axis) {
             if (std::isfinite(axis.position) &&
                 std::isfinite(axis.velocity) &&
@@ -10599,9 +12956,7 @@ private:
         if (aiming)
             idleLayer = 0.38f;
 
-        // The procedural idle wave is an "alive" layer, not locomotion.
-        // Fade it to a much smaller amplitude after genuine sustained idle so
-        // it reads as breathing/weight instead of continuous camera drift.
+        // Fade idle wave after sustained rest; reserve it for subtle breathing/weight.
         if (stationaryTime_ >= cfg_.idleSettleDelay) {
             const float settleAge =
                 stationaryTime_ - cfg_.idleSettleDelay;
@@ -10616,14 +12971,12 @@ private:
         vertical *= idleLayer * (cfg_.idleScale * cfg_.presetAmbient) * ambientDuck_;
         forward *= idleLayer * (cfg_.idleScale * cfg_.presetAmbient) * ambientDuck_;
 
-        // Fully settle the always-on "alive" layer at genuine rest.
         if (fullySettledIdle) {
             side = 0.0f;
             vertical = 0.0f;
             forward = 0.0f;
         }
 
-        // Body/locomotion layer.
         side +=
             gaitSpring_.side.position +
             lookSpring_.side.position;
@@ -10645,8 +12998,7 @@ private:
         vertical *= bodyScale;
         forward *= bodyScale;
 
-        // Recoil is applied AFTER aim damping. Firing while aiming should
-        // remain visible even though ordinary bob is intentionally calmer.
+        // Apply recoil after aim damping so aiming does not hide shots.
         side +=
             recoilSpring_.side.position *
             cfg_.strength * cfg_.presetScale;
@@ -10663,8 +13015,7 @@ private:
         vertical += impactSpring_.vertical.position * cfg_.strength * cfg_.presetScale;
         forward += impactSpring_.forward.position * cfg_.strength * cfg_.presetScale;
 
-        // Chainsaw engine/cutting pressure is a direct bounded layer, not
-        // persistent spring state. It vanishes immediately when weapon changes.
+        // Chainsaw pressure is a bounded frame-local layer; clear on weapon switch.
         forward +=
             chainsawForwardBias_ *
             cfg_.strength *
@@ -10684,7 +13035,6 @@ private:
              weatherForward_+nativeShakeForward_)*ambientScale+
             obstructionSpring_.forward.position;
 
-        // Thrust/acceleration is player motion, not ambient world vibration.
         if (cfg_.advancedResponseEnabled && cfg_.jetpackDirectionalEnabled && previousJetpack_) {
             const float jetpackScale = cfg_.strength * cfg_.presetScale;
             side += jetpackResponseSide_ * jetpackScale;
@@ -10694,10 +13044,7 @@ private:
 
         const float finalScale = cfg_.strength;
 
-        // Orientation layer. CMatrix uses:
-        //   right = camera right
-        //   up    = camera forward
-        //   at    = camera vertical/up.
+        // CMatrix basis: right=camera right, up=camera forward, at=camera vertical.
         const float footPhase =
             Moving(motion_) ?
             Clamp(footDiff_ * 2.7f, -1.0f, 1.0f) :
@@ -10729,7 +13076,6 @@ private:
                 cfg_.gaitRollDeg *
                 strengthNow_;
 
-            // Touchdown spring adds a short pitch response.
             const float gaitVerticalNorm =
                 cfg_.gaitVertical > 0.001f ?
                 Clamp(
@@ -10752,7 +13098,6 @@ private:
         const float pitchRateNorm =
             Clamp(pitchRate_ / 6.0f, -1.0f, 1.0f);
 
-        // Lean slightly opposite a camera turn, plus a tiny yaw lag.
         rollDeg +=
             -yawRateNorm *
             cfg_.turnRollDeg;
@@ -10853,9 +13198,7 @@ private:
             yawDeg += directionalRotationSpring_.forward.position;
         }
 
-        // Orientation is opt-in. It is applied only to the RenderWare frame
-        // after GTA has copied its stock camera matrix, never to GTA's internal
-        // CCamera basis. Translation-only remains the default safe path.
+        // Rotation is opt-in on RenderWare's frame only; GTA's internal CCamera basis stays untouched.
         if (cfg_.rotationEnabled) {
             pitchDeg *= cfg_.rotationSafetyScale * cfg_.presetRotation * contextScale_;
             rollDeg *= cfg_.rotationSafetyScale * cfg_.presetRotation * contextScale_;
@@ -11140,18 +13483,12 @@ private:
             (lastRuntimeReloadMs_ == 0 ||
              now - lastRuntimeReloadMs_ >= cfg_.runtimeReloadDebounceMs)) {
             const bool wasLogging =
-                cfg_.debug || cfg_.auditEnabled || cfg_.scanProfilingEnabled;
-            if (!cr::ReloadConfigFresh(cfg_)) {
-                log_.Write("CONFIG RELOAD SKIPPED: failed to load a valid path");
-                reloadKeyWasDown_ = down;
-                return;
-            }
-            scanProfiler_.Reset();
-            lastScanProfileMs_ = now;
+                cfg_.debug || cfg_.auditEnabled;
+            cfg_.Load();
             lastRuntimeReloadMs_ = now;
 
             const bool wantsLogging =
-                cfg_.debug || cfg_.auditEnabled || cfg_.scanProfilingEnabled;
+                cfg_.debug || cfg_.auditEnabled;
             if (wasLogging != wantsLogging)
                 log_.Init(cfg_.dir, wantsLogging);
 
@@ -11192,75 +13529,101 @@ private:
         char line4[256] = {};
 
         std::snprintf(line1, sizeof(line1),
-            "GTASA: Camera Response v0.9 | Created by Zeneric | Inspired by MachineGames  preset=%s  state=%s  hook=%d",
+            "Camera Response | %s | %s | hook=%d | %s tick=%llu",
             cfg_.presetName, vehicleInit_ ? "VEHICLE" : MotionName(motion_),
-            cameraCommitHookInstalled_ ? 1 : 0);
+            cameraCommitHookInstalled_ ? 1 : 0, UpdateSourceName(),
+            static_cast<unsigned long long>(updates_));
         std::snprintf(line2, sizeof(line2),
-            "offset S/V/F %.3f %.3f %.3f  surface=%u x%.2f nearVeh=%u",
-            pendingSide_, pendingVertical_, pendingForward_, currentSurfaceId_, currentSurfaceMultiplier_,
-            nearbyVehicleContributors_);
+            "offset S/V/F %.3f / %.3f / %.3f | surface=%u x%.2f | nearVeh=%u",
+            pendingSide_, pendingVertical_, pendingForward_, currentSurfaceId_,
+            currentSurfaceMultiplier_, nearbyVehicleContributors_);
         if (vehicleInit_) {
             std::snprintf(line3, sizeof(line3),
-                "veh spd=%.3f aF/S/Z %.2f %.2f %.2f tgt S/V/F %.3f %.3f %.3f hit=%u dmg=%u susp=%u horn=%d gate=%s",
+                "veh speed=%.2f accel F/S/Z %.2f/%.2f/%.2f | hit=%u dmg=%u susp=%u horn=%d gate=%s",
                 vehicleSpeed_, vehicleForwardAccel_, vehicleSideAccel_,
-                vehicleVerticalAccelNow_, vehicleTargetSide_, vehicleTargetVertical_,
-                vehicleTargetForward_, vehicleImpacts_, vehicleDamageCrashes_,
+                vehicleVerticalAccelNow_, vehicleImpacts_, vehicleDamageCrashes_,
                 vehicleSuspensionImpacts_, vehicleHornActive_ ? 1 : 0,
                 lastGate_.empty() ? "?" : lastGate_.c_str());
         } else {
             std::snprintf(line3, sizeof(line3),
-                "steps %u/%u  shots=%u streak=%u melee=%u  gate=%s",
+                "steps=%u/%u | shots=%u streak=%u melee=%u | gate=%s",
                 leftSteps_, rightSteps_, shots_, shotStreak_, meleeContacts_,
                 lastGate_.empty() ? "?" : lastGate_.c_str());
         }
 
         if (cfg_.detailedDebugHud) {
             const cr::MixTelemetry& telemetry = responseMixer_.Telemetry();
-            std::snprintf(
-                line4,
-                sizeof(line4),
-                "mix events=%u drop=%u band L/M/H %.3f/%.3f/%.3f rot P/R/Y %.2f/%.2f/%.2f",
-                telemetry.accepted,
-                telemetry.dropped,
+            std::snprintf(line4, sizeof(line4),
+                "mix=%u drop=%u | bands L/M/H %.3f/%.3f/%.3f | rotation P/R/Y %.2f/%.2f/%.2f",
+                telemetry.accepted, telemetry.dropped,
                 std::fabs(telemetry.band[(unsigned)cr::ResponseBand::Low].vertical),
                 std::fabs(telemetry.band[(unsigned)cr::ResponseBand::Mid].vertical),
                 std::fabs(telemetry.band[(unsigned)cr::ResponseBand::High].vertical),
-                lastPitchDeg_,
-                lastRollDeg_,
-                lastYawDeg_
-            );
+                lastPitchDeg_, lastRollDeg_, lastYawDeg_);
+        }
+
+        const int width = RsGlobal.maximumWidth;
+        const int height = RsGlobal.maximumHeight;
+        if (width < 320 || height < 200)
+            return;
+
+        // Query the game window's DPI without changing the host process's awareness.
+        const unsigned dpi = GetOverlayWindowDpi();
+        const cr::OverlayLayout layout =
+            cr::ComputeOverlayLayout(width, height, dpi, cfg_.overlayScale);
+
+        if (width != overlayWidth_ || height != overlayHeight_ ||
+            dpi != overlayDpi_ || cfg_.overlayScale != overlayScaleLogged_) {
+            overlayWidth_ = width;
+            overlayHeight_ = height;
+            overlayDpi_ = dpi;
+            overlayScaleLogged_ = cfg_.overlayScale;
+            log_.WriteImportant("OVERLAY resolution=%dx%d dpi=%u userScale=%.2f font=%.2f/%.2f",
+                width, height, dpi, cfg_.overlayScale, layout.fontX, layout.fontY);
         }
 
         CFont::SetOrientation(ALIGN_LEFT);
-        CFont::SetColor(CRGBA(255, 255, 255, 220));
-        CFont::SetDropShadowPosition(1);
-        CFont::SetBackground(false, false);
-        CFont::SetWrapx(620.0f);
-        CFont::SetScale(0.32f, 0.65f);
         CFont::SetFontStyle(FONT_SUBTITLES);
         CFont::SetProportional(true);
-        CFont::PrintString(18.0f, 24.0f, line1);
-        CFont::PrintString(18.0f, 40.0f, line2);
-        CFont::PrintString(18.0f, 56.0f, line3);
-        if (cfg_.detailedDebugHud)
-            CFont::PrintString(18.0f, 72.0f, line4);
+        CFont::SetColor(CRGBA(255, 255, 255, 240));
+        CFont::SetDropShadowPosition(2);
+        CFont::SetDropColor(CRGBA(0, 0, 0, 255));
+        CFont::SetBackground(false, false);
+        CFont::SetWrapx(layout.wrapX);
+        CFont::SetScale(layout.fontX, layout.fontY);
+
+        // Avoid wrapped telemetry lines overlapping the following row.
+        const char* textLines[] = {line1, line2, line3, line4};
+        const int count = cfg_.detailedDebugHud ? 4 : 3;
+        float widest = 0.0f;
+        for (int i = 0; i < count; ++i) {
+            widest = std::max(widest, CFont::GetStringWidth(textLines[i], true, false));
+        }
+        const float availableWidth = layout.wrapX - layout.x - 8.0f;
+        const float fit = widest > availableWidth && widest > 1.0f
+            ? Clamp(availableWidth / widest, 0.60f, 1.0f)
+            : 1.0f;
+        if (fit < 1.0f)
+            CFont::SetScale(layout.fontX * fit, layout.fontY * fit);
+
+        for (int i = 0; i < count; ++i)
+            CFont::PrintString(layout.x, layout.firstY + i * layout.rowHeight * fit, textLines[i]);
     }
 
     void GameUpdate() {
         AuditHit(AUD_GameUpdate);
         ++updates_;
+        if (updates_ == 1)
+            log_.WriteImportant("GAME UPDATE started source=%s frame=%u",
+                UpdateSourceName(), CTimer::m_FrameCounter);
         VerifyCameraCommitHook();
         const float dt = Dt();
         UpdateRuntimeReload();
         AuditTick();
-        ReportScanProfiles();
 
         CPlayerPed* p = FindPlayerPed();
         if (!p) {
             pendingAllowed_ = false;
-            pendingSide_ = pendingVertical_ = pendingForward_ = 0.0f;
-            pendingPitchRad_ = pendingRollRad_ = pendingYawRad_ = 0.0f;
-            lastPitchDeg_ = lastRollDeg_ = lastYawDeg_ = 0.0f;
             fovMultiplier_ = 1.0f;
             fovKick_ = 0.0f;
             RemoveFovOutput();
@@ -11303,9 +13666,7 @@ private:
             if (!vehicle)
                 vehicle = FindPlayerVehicle(-1, false);
 
-            // Vehicle cameras own their own spring state. Clear pedestrian
-            // movement targets so entering/exiting a vehicle cannot inherit a
-            // stale footstep or look impulse.
+            // Reset on-foot springs on vehicle entry/exit to prevent inherited impulses.
             motion_ = MotionState::Disabled;
             gaitTargetSide_ = gaitTargetVertical_ = gaitTargetForward_ = 0.0f;
             lookTargetSide_ = lookTargetVertical_ = lookTargetForward_ = 0.0f;
@@ -11325,7 +13686,7 @@ private:
             }
 
             BeginEnvironmentFrame();
-            DrainExternalImpulseQueue();
+        DrainExternalImpulseQueue();
             UpdatePlayerVehicleTransition(p, true, vehicle);
             UpdateDamage(p);
             UpdateExplosions(p);
@@ -11342,9 +13703,10 @@ private:
             UpdateCameraObstructionResponse(p, vehicle, dt);
             CommitEnvironmentFrame();
 
-            // Player weapon/melee response remains active in both stock
+            // Keep player weapon/melee updates active in both vehicle and on-foot modes.
             UpdateWeapon(p, pad);
             CommitTransientEvents();
+            UpdateAmbientDucking(dt);
 
             recoilSpring_.Update(
             dt,
@@ -11364,7 +13726,6 @@ private:
             recoilSpring_.side.position =
                 Clamp(recoilSpring_.side.position, -0.06f, 0.06f);
 
-            // Keep common blast/damage/NPC-gunfire/melee reactions alive while driving.
             impactSpring_.Update(
                 dt,
                 cfg_.spring * 0.82f,
@@ -11373,8 +13734,7 @@ private:
             UpdateVehicle(vehicle, dt);
             UpdateMountedWeapons(p, vehicle, dt);
 
-            // UpdateVehicle can publish jerk/crash transients, so consume the
-            // second batch before final camera composition.
+            // Consume vehicle-published jerk/crash events before final composition.
             CommitTransientEvents();
             UpdateAmbientDucking(dt);
 
@@ -11384,8 +13744,6 @@ private:
                 cfg_.directionalRotationDamping*cfg_.presetRecovery
             );
 
-            // Match the on-foot path: release expired sources and stuck tails.
-            UpdateResponseWatchdog();
             PrepareVehicleOffset(vehicle, dt);
             UpdateFovResponse(p, cam, aiming, true, true, dt);
             LogStatus(p, cam, gate, false);
@@ -11404,13 +13762,10 @@ private:
             lookTargetForward_ = 0.0f;
 
             UpdateSprings(dt);
-            StabilizeTransientState();
+        StabilizeTransientState();
 
             pendingAllowed_ = false;
-            // Never leave the last valid camera transform in diagnostics/state
-            // while output is gated. It was not being applied, but the stale
-            // values made the log look as though a disabled response was still
-            // active and could leak through external API readers.
+            // Clear gated camera output and diagnostics to avoid stale API/log values.
             pendingSide_ = 0.0f;
             pendingVertical_ = 0.0f;
             pendingForward_ = 0.0f;
@@ -11495,7 +13850,589 @@ private:
         LogStatus(p, cam, gate, aiming);
     }
 
-#include "CameraResponseCameraIntegration.inc"
+    static void __fastcall CameraCopyThunk(
+        CCamera* camera,
+        void*,
+        bool updateMatrix
+    ) {
+        if (instance_) {
+            instance_->OnCameraCommit(camera, updateMatrix);
+            return;
+        }
+
+        if (originalCopyCamera_)
+            originalCopyCamera_(camera, updateMatrix);
+    }
+
+
+
+
+
+
+    static std::string ModulePathForAddress(uintptr_t address) {
+        if (!address)
+            return {};
+
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery(
+                reinterpret_cast<LPCVOID>(address),
+                &mbi,
+                sizeof(mbi))) {
+            return {};
+        }
+
+        HMODULE module =
+            reinterpret_cast<HMODULE>(mbi.AllocationBase);
+
+        char path[1024] = {};
+        const DWORD length =
+            GetModuleFileNameA(
+                module,
+                path,
+                static_cast<DWORD>(sizeof(path))
+            );
+
+        return length > 0 ?
+            std::string(path, length) :
+            std::string();
+    }
+
+    static bool IsReadableCodeSpan(uintptr_t address, size_t length) {
+        if (!address || !length || address + length < address)
+            return false;
+
+        const uintptr_t end = address + length;
+        for (uintptr_t cursor = address; cursor < end;) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (!VirtualQuery(reinterpret_cast<LPCVOID>(cursor), &mbi, sizeof(mbi)))
+                return false;
+
+            const DWORD access = mbi.Protect & 0xFFu;
+            if (mbi.State != MEM_COMMIT ||
+                (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) ||
+                (access != PAGE_READONLY && access != PAGE_READWRITE &&
+                 access != PAGE_WRITECOPY && access != PAGE_EXECUTE_READ &&
+                 access != PAGE_EXECUTE_READWRITE && access != PAGE_EXECUTE_WRITECOPY))
+                return false;
+
+            const uintptr_t regionEnd =
+                reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+            if (regionEnd <= cursor)
+                return false;
+            cursor = std::min(end, regionEnd);
+        }
+        return true;
+    }
+
+    static uintptr_t DecodeRelativeCallTarget(uintptr_t callsite) {
+        const uint8_t* call =
+            reinterpret_cast<const uint8_t*>(callsite);
+
+        if (call[0] != 0xE8)
+            return 0;
+
+        const int32_t rel =
+            *reinterpret_cast<const int32_t*>(callsite + 1);
+
+        return callsite + 5 + rel;
+    }
+
+    bool ValidateCameraCommitCallsite() const {
+        constexpr uintptr_t kProcessCopyCallsite = 0x52C98B;
+
+        if (!IsReadableCodeSpan(kProcessCopyCallsite - 3, 3 + 5 + 12))
+            return false;
+
+        const uint8_t* prefix =
+            reinterpret_cast<const uint8_t*>(kProcessCopyCallsite - 3);
+        const uint8_t* call =
+            reinterpret_cast<const uint8_t*>(kProcessCopyCallsite);
+        const uint8_t* suffix =
+            reinterpret_cast<const uint8_t*>(kProcessCopyCallsite + 5);
+
+        const bool prefixOk =
+            prefix[0] == 0x55 &&
+            prefix[1] == 0x8B &&
+            prefix[2] == 0xCE &&
+            call[0] == 0xE8;
+
+        const uint8_t expectedSuffix[] = {
+            0x8B, 0x8E, 0xA8, 0x09, 0x00, 0x00,
+            0x8B, 0x86, 0xA4, 0x09, 0x00, 0x00
+        };
+
+        bool suffixOk = true;
+        for (unsigned i = 0; i < sizeof(expectedSuffix); ++i) {
+            if (suffix[i] != expectedSuffix[i]) {
+                suffixOk = false;
+                break;
+            }
+        }
+
+        return prefixOk && suffixOk;
+    }
+
+    void InstallCameraCommitHook() {
+        AuditHit(AUD_InstallCameraCommitHook);
+        constexpr uintptr_t kProcessCopyCallsite = 0x52C98B;
+        constexpr uintptr_t kExpectedCopyFunction = 0x50AFA0;
+
+        if (!ValidateCameraCommitCallsite()) {
+            log_.WriteImportant(
+                "ERROR: unsupported camera callsite signature at 0x%08X; hook NOT installed. "
+                "Requires Classic US 1.0 and compatible camera-hook mods.",
+                static_cast<unsigned>(kProcessCopyCallsite)
+            );
+            cameraCommitHookInstalled_ = false;
+            log_.Flush();
+            return;
+        }
+
+        const uintptr_t decodedTarget =
+            DecodeRelativeCallTarget(kProcessCopyCallsite);
+
+        const uintptr_t ourTarget =
+            reinterpret_cast<uintptr_t>(&CameraCopyThunk);
+
+        if (decodedTarget == ourTarget) {
+            cameraCommitHookInstalled_ = true;
+
+            if (!originalCopyCamera_) {
+                originalCopyCamera_ =
+                    reinterpret_cast<CopyCameraFn>(kExpectedCopyFunction);
+                previousCopyTarget_ = kExpectedCopyFunction;
+            }
+
+            log_.Write(
+                "CAMERA COMMIT HOOK already active callsite=0x%08X target=%p original=%p",
+                static_cast<unsigned>(kProcessCopyCallsite),
+                reinterpret_cast<void*>(decodedTarget),
+                reinterpret_cast<void*>(previousCopyTarget_)
+            );
+            log_.Flush();
+            return;
+        }
+
+        auto previous = injector::MakeCALL(
+            kProcessCopyCallsite,
+            injector::raw_ptr(&CameraCopyThunk),
+            true
+        );
+
+        const uintptr_t previousTarget =
+            reinterpret_cast<uintptr_t>(previous.get<void>());
+
+        // Chain existing CALL redirections; yield if another plugin later replaces our hook.
+        originalCopyCamera_ =
+            reinterpret_cast<CopyCameraFn>(
+                previousTarget != 0 ?
+                previousTarget :
+                kExpectedCopyFunction
+            );
+        previousCopyTarget_ =
+            previousTarget != 0 ?
+                previousTarget :
+                kExpectedCopyFunction;
+
+        cameraCommitHookInstalled_ =
+            DecodeRelativeCallTarget(kProcessCopyCallsite) == ourTarget &&
+            originalCopyCamera_ != nullptr;
+
+        log_.Write(
+            "CAMERA COMMIT HOOK callsite=0x%08X decodedBefore=%p previous=%p originalNow=%p "
+            "expected=0x%08X installed=%d restoreCount=%u",
+            static_cast<unsigned>(kProcessCopyCallsite),
+            reinterpret_cast<void*>(decodedTarget),
+            reinterpret_cast<void*>(previousTarget),
+            reinterpret_cast<void*>(previousCopyTarget_),
+            static_cast<unsigned>(kExpectedCopyFunction),
+            cameraCommitHookInstalled_ ? 1 : 0,
+            cameraHookRestoreCount_
+        );
+
+        if (decodedTarget != kExpectedCopyFunction &&
+            decodedTarget != ourTarget) {
+            log_.Write(
+                "NOTICE: camera CALL was redirected to %p before CameraResponse hook",
+                reinterpret_cast<void*>(decodedTarget)
+            );
+        }
+
+        log_.Flush();
+    }
+
+    void VerifyCameraCommitHook() {
+        AuditHit(AUD_VerifyCameraCommitHook);
+        constexpr uintptr_t kProcessCopyCallsite = 0x52C98B;
+
+        const unsigned now =
+            CTimer::m_snTimeInMilliseconds;
+
+        if (lastCameraHookCheckMs_ != 0 &&
+            now - lastCameraHookCheckMs_ < 500u) {
+            return;
+        }
+
+        lastCameraHookCheckMs_ = now;
+
+        if (!ValidateCameraCommitCallsite()) {
+            if (cameraCommitHookInstalled_) {
+                cameraCommitHookInstalled_ = false;
+                log_.Write(
+                    "ERROR: camera hook callsite signature changed; CameraResponse disabled commit hook"
+                );
+                log_.Flush();
+            }
+            return;
+        }
+
+        const uintptr_t currentTarget =
+            DecodeRelativeCallTarget(kProcessCopyCallsite);
+
+        const uintptr_t ourTarget =
+            reinterpret_cast<uintptr_t>(&CameraCopyThunk);
+
+        if (currentTarget == ourTarget) {
+            cameraCommitHookInstalled_ = true;
+            return;
+        }
+
+        ++cameraHookRestoreCount_;
+        cameraCommitHookInstalled_ = false;
+
+        const std::string owner =
+            ModulePathForAddress(currentTarget);
+
+        // Never watchdog-repatch the CALL; disable output if another mod takes ownership.
+        log_.Write(
+            "CAMERA HOOK LOST current=%p owner=%s expectedSelf=%p; "
+            "CameraResponse yielding (no automatic repatch) count=%u",
+            reinterpret_cast<void*>(currentTarget),
+            owner.empty() ? "<unknown>" : owner.c_str(),
+            reinterpret_cast<void*>(ourTarget),
+            cameraHookRestoreCount_
+        );
+        log_.Flush();
+    }
+
+
+
+    void ClipCameraOffsetAgainstWorld(
+        CPlayerPed* player,
+        const CVector& origin,
+        CVector& worldOffset
+    ) {
+        AuditHit(AUD_ClipCameraOffsetAgainstWorld);
+        if (!cfg_.cameraOffsetCollisionEnabled)
+            return;
+
+        const float length =
+            std::sqrt(
+                worldOffset.x * worldOffset.x +
+                worldOffset.y * worldOffset.y +
+                worldOffset.z * worldOffset.z
+            );
+
+        if (length <= 0.0005f)
+            return;
+
+        CVector target{
+            origin.x + worldOffset.x,
+            origin.y + worldOffset.y,
+            origin.z + worldOffset.z
+        };
+
+        CColPoint hit{};
+        CEntity* hitEntity = nullptr;
+        CEntity* oldIgnore = CWorld::pIgnoreEntity;
+        CWorld::pIgnoreEntity = player;
+
+        const bool blocked =
+            CWorld::ProcessLineOfSight(
+                origin,
+                target,
+                hit,
+                hitEntity,
+                true,   // buildings
+                false,  // vehicles
+                false,  // peds
+                true,   // objects
+                true,   // dummies
+                false,  // see-through
+                true,   // camera-ignore
+                false   // shoot-through
+            );
+
+        CWorld::pIgnoreEntity = oldIgnore;
+
+        if (!blocked)
+            return;
+
+        const float hx = hit.m_vecPoint.x - origin.x;
+        const float hy = hit.m_vecPoint.y - origin.y;
+        const float hz = hit.m_vecPoint.z - origin.z;
+        const float hitDistance =
+            std::sqrt(hx * hx + hy * hy + hz * hz);
+
+        const float allowed =
+            std::max(
+                0.0f,
+                hitDistance - cfg_.cameraOffsetCollisionPadding
+            );
+
+        if (allowed >= length)
+            return;
+
+        const float scale = allowed / length;
+        worldOffset.x *= scale;
+        worldOffset.y *= scale;
+        worldOffset.z *= scale;
+    }
+
+
+    void OnCameraCommit(
+        CCamera* camera,
+        bool updateMatrix
+    ) {
+        AuditHit(AUD_OnCameraCommit);
+        ++commitCalls_;
+
+        if (!originalCopyCamera_)
+            return;
+
+        if (!camera || !pendingAllowed_) {
+            originalCopyCamera_(camera, updateMatrix);
+            return;
+        }
+
+        CPlayerPed* p = FindPlayerPed();
+
+        if (!p) {
+            originalCopyCamera_(camera, updateMatrix);
+            return;
+        }
+
+        CCam& cam =
+            camera->m_aCams[camera->m_nActiveCam];
+
+        CPad* pad = p->GetPadFromPlayer();
+        const bool aiming =
+            (pad && pad->GetTarget()) ||
+            p->bIsAimingGun;
+
+        const bool meleeLockOn =
+            IsControllerMeleeLockOn(
+                p,
+                pad,
+                aiming
+            );
+
+        const char* commitGate =
+            Gate(
+                p,
+                cam,
+                cameraContext_
+            );
+
+        if (std::strcmp(commitGate, "OK") != 0 &&
+            std::strcmp(commitGate, "OK-VEHICLE") != 0) {
+            originalCopyCamera_(camera, updateMatrix);
+            return;
+        }
+
+        CVector forward = cam.m_vecFront;
+        CVector up = cam.m_vecUp;
+
+        const float fLen = std::sqrt(
+            forward.x * forward.x +
+            forward.y * forward.y +
+            forward.z * forward.z
+        );
+
+        const float uLen = std::sqrt(
+            up.x * up.x +
+            up.y * up.y +
+            up.z * up.z
+        );
+
+        if (fLen <= 0.00001f || uLen <= 0.00001f) {
+            originalCopyCamera_(camera, updateMatrix);
+            return;
+        }
+
+        forward.x /= fLen;
+        forward.y /= fLen;
+        forward.z /= fLen;
+
+        up.x /= uLen;
+        up.y /= uLen;
+        up.z /= uLen;
+
+        CVector right;
+        right.x = forward.y * up.z - forward.z * up.y;
+        right.y = forward.z * up.x - forward.x * up.z;
+        right.z = forward.x * up.y - forward.y * up.x;
+
+        const float rLen = std::sqrt(
+            right.x * right.x +
+            right.y * right.y +
+            right.z * right.z
+        );
+
+        if (rLen <= 0.00001f) {
+            originalCopyCamera_(camera, updateMatrix);
+            return;
+        }
+
+        right.x /= rLen;
+        right.y /= rLen;
+        right.z /= rLen;
+
+        CVector worldOffset;
+        worldOffset.x =
+            right.x * pendingSide_ +
+            up.x * pendingVertical_ +
+            forward.x * pendingForward_;
+
+        worldOffset.y =
+            right.y * pendingSide_ +
+            up.y * pendingVertical_ +
+            forward.y * pendingForward_;
+
+        worldOffset.z =
+            right.z * pendingSide_ +
+            up.z * pendingVertical_ +
+            forward.z * pendingForward_;
+
+        if (!std::isfinite(worldOffset.x) ||
+            !std::isfinite(worldOffset.y) ||
+            !std::isfinite(worldOffset.z)) {
+
+            pendingAllowed_ = false;
+            originalCopyCamera_(camera, updateMatrix);
+            log_.Write("SAFETY: rejected non-finite camera offset");
+            return;
+        }
+
+        ClipCameraOffsetAgainstWorld(
+            p,
+            camera->m_mCameraMatrix.pos,
+            worldOffset
+        );
+
+        worldOffset.x = Clamp(worldOffset.x, -1.0f, 1.0f);
+        worldOffset.y = Clamp(worldOffset.y, -1.0f, 1.0f);
+        worldOffset.z = Clamp(worldOffset.z, -1.0f, 1.0f);
+
+        // Temporarily translate GTA's camera matrix for its stock copy; preserve its orientation basis.
+        const CVector savedPos =
+            camera->m_mCameraMatrix.pos;
+
+        lastMatrixBase_ = savedPos;
+
+        camera->m_mCameraMatrix.pos.x += worldOffset.x;
+        camera->m_mCameraMatrix.pos.y += worldOffset.y;
+        camera->m_mCameraMatrix.pos.z += worldOffset.z;
+
+        lastMatrixForced_ =
+            camera->m_mCameraMatrix.pos;
+
+        originalCopyCamera_(camera, updateMatrix);
+
+        // If the RW frame missed the translated copy, synchronize its position and update objects.
+        if (camera->m_pRwCamera) {
+            RwFrame* frame =
+                RwCameraGetFrame(camera->m_pRwCamera);
+
+            if (frame) {
+                RwMatrix* frameMatrix =
+                    RwFrameGetMatrix(frame);
+
+                if (frameMatrix) {
+                    const float dx =
+                        frameMatrix->pos.x - lastMatrixForced_.x;
+                    const float dy =
+                        frameMatrix->pos.y - lastMatrixForced_.y;
+                    const float dz =
+                        frameMatrix->pos.z - lastMatrixForced_.z;
+                    const float distSq =
+                        dx * dx + dy * dy + dz * dz;
+
+                    if (distSq > 0.0025f) {
+                        frameMatrix->pos.x =
+                            lastMatrixForced_.x;
+                        frameMatrix->pos.y =
+                            lastMatrixForced_.y;
+                        frameMatrix->pos.z =
+                            lastMatrixForced_.z;
+
+                        RwFrameUpdateObjects(frame);
+                        ++rwFrameFallbacks_;
+                    }
+
+                    if (cfg_.rotationEnabled &&
+                        (std::fabs(pendingPitchRad_) > 0.000001f ||
+                         std::fabs(pendingRollRad_) > 0.000001f ||
+                         std::fabs(pendingYawRad_) > 0.000001f)) {
+                        if (ApplyLocalRwRotation(
+                                frameMatrix,
+                                pendingPitchRad_,
+                                pendingRollRad_,
+                                pendingYawRad_)) {
+                            RwFrameUpdateObjects(frame);
+                        } else {
+                            lastPitchDeg_ = 0.0f;
+                            lastRollDeg_ = 0.0f;
+                            lastYawDeg_ = 0.0f;
+                        }
+                    }
+
+                    lastRwFramePos_.x =
+                        frameMatrix->pos.x;
+                    lastRwFramePos_.y =
+                        frameMatrix->pos.y;
+                    lastRwFramePos_.z =
+                        frameMatrix->pos.z;
+                }
+            }
+        }
+
+        // Restore GTA's original matrix; RenderWare retains the rendered transform.
+        camera->m_mCameraMatrix.pos =
+            savedPos;
+
+        ++commitApplied_;
+
+        if (commitApplied_ <= 8) {
+            log_.Write(
+                "COMMIT APPLY #%llu update=%d pending=(%.4f %.4f %.4f) rotDeg=(%.3f %.3f %.3f) "
+                "world=(%.4f %.4f %.4f) "
+                "matrix=(%.3f %.3f %.3f)->(%.3f %.3f %.3f) "
+                "rw=(%.3f %.3f %.3f) fallback=%llu",
+                static_cast<unsigned long long>(commitApplied_),
+                updateMatrix ? 1 : 0,
+                pendingSide_,
+                pendingVertical_,
+                pendingForward_,
+                lastPitchDeg_,
+                lastRollDeg_,
+                lastYawDeg_,
+                worldOffset.x,
+                worldOffset.y,
+                worldOffset.z,
+                lastMatrixBase_.x,
+                lastMatrixBase_.y,
+                lastMatrixBase_.z,
+                lastMatrixForced_.x,
+                lastMatrixForced_.y,
+                lastMatrixForced_.z,
+                lastRwFramePos_.x,
+                lastRwFramePos_.y,
+                lastRwFramePos_.z,
+                static_cast<unsigned long long>(rwFrameFallbacks_)
+            );
+        }
+    }
 
     void Reset(const char* why) {
         log_.Write("RESET %s", why ? why : "?");

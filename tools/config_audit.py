@@ -1,76 +1,58 @@
 #!/usr/bin/env python3
+"""Ensure every exposed INI setting has exactly one C++ load site.
+
+Internal-only calibration is intentionally absent from the external INI.
+"""
+from collections import Counter
 from pathlib import Path
+import configparser
 import re
 import sys
 
 root = Path(__file__).resolve().parents[1]
-# Loader implementation can live in an included module.
-cpp = "\n".join(
-    path.read_text(encoding="utf-8", errors="replace")
-    for path in sorted((root / "source").glob("*.inc"))
-) + "\n" + (root / "source" / "CameraResponse.cpp").read_text(
-    encoding="utf-8", errors="replace"
+cpp = (root / "source" / "CameraResponse.cpp").read_text(encoding="utf-8")
+ini = root / "CameraResponse.ini"
+
+cfg = configparser.ConfigParser(interpolation=None, strict=True)
+cfg.optionxform = str
+cfg.read(ini, encoding="utf-8")
+keys = {(section, key) for section in cfg.sections() for key in cfg[section]}
+
+# Match calls rather than literal expressions split across lines.
+load_pattern = re.compile(
+    r'\bRead(?:Bool|Int|Float|String)\(\s*iniPath\s*,\s*"([^"]+)"\s*,\s*"([^"]+)"'
 )
-ini = (root / "CameraResponse.ini").read_text(encoding="utf-8", errors="replace")
+loaded = Counter(load_pattern.findall(cpp))
 
-section = None
-ini_set = set()
-duplicates = []
-missing_comments = []
-for raw in ini.splitlines():
-    line = raw.strip()
-    if not line or line.startswith(";"):
-        continue
-    if line.startswith("[") and line.endswith("]"):
-        section = line[1:-1]
-        continue
-    if "=" in line and section:
-        key, value = line.split("=", 1)
-        pair = (section, key.strip())
-        if pair in ini_set:
-            duplicates.append(pair)
-        if not value.strip() or " ; " not in value:
-            missing_comments.append(pair)
-        ini_set.add(pair)
+missing_loader = sorted(keys - loaded.keys())
+unexpected_loader = sorted(loaded.keys() - keys)
+duplicate_loads = sorted(k for k, n in loaded.items() if n != 1)
 
-loaded = set(re.findall(
-    r'Read(?:Bool|Int|Float)\(\s*iniPath,\s*"([^"]+)",\s*"([^"]+)"',
-    cpp
-))
-loaded.update(re.findall(
-    r'ReadString\(\s*iniPath,\s*"([^"]+)",\s*"([^"]+)"',
-    cpp
-))
+for title, items in (
+    ("INI settings without a loader", missing_loader),
+    ("C++ loaders for missing INI keys", unexpected_loader),
+    ("INI settings loaded more than once", duplicate_loads),
+):
+    if items:
+        print(f"ERROR: {title}:")
+        for section, key in items:
+            print(f"  [{section}] {key}")
 
-recoil_names=["Colt45","Silenced","DesertEagle","Shotgun","Sawnoff","Spas12","MicroUzi","MP5","AK47","M4","Tec9","CountryRifle","SniperRifle","RocketLauncher","HeatSeeker","Flamethrower","Minigun"]
-for name in recoil_names:
-    for suffix in ("Scale","Vertical","Forward","Side","Recovery"):
-        loaded.add(("WeaponRecoilProfiles", f"{name}.{suffix}"))
+deprecated = {
+    "Safety", "Performance", "WeaponRecoilProfiles", "MeleeWeaponProfiles",
+    "DebugAuditInternals"
+}
+exposed_internal = deprecated.intersection(cfg.sections())
+if exposed_internal:
+    print(f"ERROR: internal sections leaked into INI: {sorted(exposed_internal)}")
 
-melee_names=["Unarmed","BrassKnuckle","GolfClub","Nightstick","Knife","BaseballBat","Shovel","PoolCue","Katana","Chainsaw","Dildo1","Dildo2","Vibrator1","Vibrator2","Flowers","Cane"]
-for name in melee_names:
-    for suffix in ("Scale","SideWeight","VerticalWeight","ReleaseForward","ReleaseSide","ContactScale","LockOnScale","CooldownMs"):
-        loaded.add(("MeleeWeaponProfiles", f"{name}.{suffix}"))
-
-missing = sorted(ini_set - loaded)
-extra = sorted(loaded - ini_set)
-
-if missing:
-    print("ERROR: INI keys without a loader:")
-    for section, key in missing:
-        print(f"  [{section}] {key}")
-
-if extra:
-    print("ERROR: source loads keys absent from CameraResponse.ini:")
-    for section, key in extra:
-        print(f"  [{section}] {key}")
-
-if duplicates:
-    print("ERROR: Duplicate INI settings:", duplicates)
-if missing_comments:
-    print("ERROR: Missing inline explanations:", missing_comments)
-
-if missing or extra or duplicates or missing_comments:
+# Confirm fixed profile calibration has not silently vanished.
+profile = re.search(r'recoilTuning\[17\]\[5\]\s*=\s*\{(.*?)\n\s*\};', cpp, re.S)
+if profile is None or len(re.findall(r'\{[^{}]+\}', profile.group(1))) != 17:
+    print("ERROR: expected 17 built-in weapon recoil profiles")
     sys.exit(1)
 
-print(f"CONFIG AUDIT OK: {len(ini_set)} settings mapped.")
+if missing_loader or unexpected_loader or duplicate_loads or exposed_internal:
+    sys.exit(1)
+
+print(f"CONFIG AUDIT OK: {len(keys)} externally configurable values across {len(cfg.sections())} sections.")

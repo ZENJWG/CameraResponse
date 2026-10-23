@@ -3,7 +3,6 @@ setlocal EnableExtensions EnableDelayedExpansion
 
 title GTASA: Camera Response v0.9 - Build
 
-rem Always switch to the folder containing this batch.
 cd /d "%~dp0"
 for %%I in (.) do set "ROOT=%%~fI"
 
@@ -25,9 +24,7 @@ echo [INFO] Project directory:
 echo        !ROOT!
 echo.
 
-rem ============================================================
 rem 1. Locate plugin-sdk
-rem ============================================================
 
 set "SDK_DIR="
 
@@ -107,9 +104,7 @@ echo         !LOCAL_SDK!\tools\premake\premake5.exe
 goto :fail
 
 :sdk_found
-rem Verify the SDK revision when this is a Git checkout. External SDKs are
-rem allowed, but a mismatch is reported because class/header changes can break
-rem a binary plugin even when compilation succeeds.
+rem Warn on plugin-sdk revision mismatch; binary layouts can differ.
 if exist "!SDK_DIR!\.git" (
     where git.exe >nul 2>nul
     if not errorlevel 1 (
@@ -131,9 +126,7 @@ echo.
 echo [OK] Plugin-SDK:
 echo      !SDK_DIR!
 
-rem ============================================================
 rem 2. Locate MSBuild
-rem ============================================================
 
 set "MSBUILD="
 set "VSWHERE=!ProgramFiles(x86)!\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -163,9 +156,7 @@ goto :fail
 echo [OK] MSBuild:
 echo      !MSBUILD!
 
-rem ============================================================
 rem 3. Make sure plugin-sdk Plugin.lib exists
-rem ============================================================
 
 if exist "!SDK_DIR!\output\lib\Plugin.lib" goto :sdk_lib_ready
 if exist "!SDK_DIR!\output\lib\plugin.lib" goto :sdk_lib_ready
@@ -211,9 +202,7 @@ goto :fail
 :sdk_lib_ready
 echo [OK] plugin-sdk GTA SA library is ready.
 
-rem ============================================================
 rem 4. Generate CameraResponse solution
-rem ============================================================
 
 echo.
 echo [INFO] Running configuration audit...
@@ -256,8 +245,7 @@ echo [INFO] Generating CameraResponse Visual Studio project...
 
 if not exist "!BUILD!" mkdir "!BUILD!"
 
-rem Remove stale Premake output so an older GTA-SA-platform solution cannot
-rem survive after changing generator settings.
+rem Remove stale solution files before regenerating.
 if exist "!BUILD!\CameraResponse.sln" del /q "!BUILD!\CameraResponse.sln" >nul 2>nul
 if exist "!BUILD!\CameraResponse.vcxproj" del /q "!BUILD!\CameraResponse.vcxproj" >nul 2>nul
 if exist "!BUILD!\CameraResponse.vcxproj.filters" del /q "!BUILD!\CameraResponse.vcxproj.filters" >nul 2>nul
@@ -279,9 +267,7 @@ goto :fail
 
 :cameraresponse_solution_ready
 
-rem ============================================================
 rem 5. Compile Release / Win32
-rem ============================================================
 
 echo.
 echo [INFO] Building CameraResponse.asi...
@@ -301,9 +287,7 @@ echo [ERROR] Build reported success, but this file is missing:
 echo         !ROOT!\bin\CameraResponse.asi
 goto :fail
 
-rem ============================================================
 rem 6. Collect final files
-rem ============================================================
 
 :collect_output
 if not exist "!DIST!" mkdir "!DIST!"
@@ -326,10 +310,8 @@ echo.
 echo Replace BOTH installed files with the versions from dist.
 echo.
 
-if not defined CI (
-    explorer "!DIST!" >nul 2>nul
-    pause
-)
+explorer "!DIST!" >nul 2>nul
+pause
 exit /b 0
 
 :copy_failed
@@ -344,5 +326,5 @@ echo ============================================================
 echo.
 echo Scroll up to the first [ERROR] line.
 echo.
-if not defined CI pause
+pause
 exit /b 1
